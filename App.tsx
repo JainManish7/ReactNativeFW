@@ -1,60 +1,81 @@
-import React, {useEffect, useState} from 'react';
-import {ActivityIndicator, View} from 'react-native';
+import { useEffect, useState } from 'react';
+import { AppState, Keyboard, View } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
-import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import LoginTouchlessScreen from './src/screens/LoginTouchlessScreen';
-import SignupScreen from './src/screens/SignupScreen';
-import VerifyOTPScreen, {RootStackParamList} from './src/screens/VerifyOTPScreen';
-import HomeActivityNewScreen from './src/screens/HomeActivityNewScreen';
-import AMCDetailsScreen from './src/screens/AMCDetailsScreen';
-import {restoreSavedSession} from './src/state/session';
-import './src/config/touchlessApiConfig';
+import RootNavigator from './src/navigation/RootNavigator';
+import AppContainer from './src/components/AppContainer';
+import ToastHost from './src/components/ToastHost';
+import NumpadDoneBar from './src/components/NumpadDoneBar';
+import ImageSourceHost from './src/components/ImageSourceHost';
+import { loadStoredLanguage } from './src/i18n';
+import { TourProvider } from './src/tour/TourContext';
+import SpotlightOverlay from './src/tour/SpotlightOverlay';
+import SplashScreen from './src/screens/SplashScreen';
+import 'react-native-gesture-handler';
 
-const Stack = createNativeStackNavigator<RootStackParamList>();
+// Any tap anywhere in the app dismisses the keyboard, including on iPhone where
+// number keypads have no Done key. Returning false lets the tap still reach
+// buttons, links and inputs underneath, so nothing else changes.
+const dismissKeyboardOnTap = () => {
+  Keyboard.dismiss();
+  return false;
+};
 
 export default function App() {
-  const [isRestoringSession, setIsRestoringSession] = useState(true);
-  const [initialRouteName, setInitialRouteName] =
-    useState<keyof RootStackParamList>('Login');
-  const [initialUserId, setInitialUserId] = useState<number | undefined>();
+  const [languageReady, setLanguageReady] = useState(false);
+  const [splashDone, setSplashDone] = useState(false);
 
   useEffect(() => {
-    (async () => {
-      const restored = await restoreSavedSession();
-      if (restored) {
-        setInitialRouteName('Home');
-        setInitialUserId(restored.userId);
-      }
-      setIsRestoringSession(false);
-    })();
+    const handler = (error: any) => {
+      console.log('UNHANDLED REJECTION:', error?.reason?.message, error?.reason?.stack);
+    };
+    // @ts-ignore
+    global.onunhandledrejection = handler;
   }, []);
 
-  if (isRestoringSession) {
-    return (
-      <View style={{flex: 1, alignItems: 'center', justifyContent: 'center'}}>
-        <ActivityIndicator size="large" />
-      </View>
-    );
+  // Camera, gallery and file pickers move the app out of the foreground; drop the
+  // keyboard then so it doesn't come back (or stay open) when the user returns.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => {
+      if (state !== 'active') Keyboard.dismiss();
+    });
+    return () => sub.remove();
+  }, []);
+
+  useEffect(() => {
+    loadStoredLanguage().finally(() => setLanguageReady(true));
+  }, []);
+
+  if (!languageReady) {
+    return null;
+  }
+
+  // Java SplashActivity runs first, then routes; RootNavigator does the routing here.
+  if (!splashDone) {
+    return <SplashScreen onFinish={() => setSplashDone(true)} />;
   }
 
   return (
-    <NavigationContainer>
-      <Stack.Navigator
-        screenOptions={{headerShown: false}}
-        initialRouteName={initialRouteName}
-      >
-        <Stack.Screen name="Login" component={LoginTouchlessScreen} />
-        <Stack.Screen name="Signup" component={SignupScreen} />
-        <Stack.Screen name="VerifyOTP" component={VerifyOTPScreen} />
-        <Stack.Screen
-          name="Home"
-          component={HomeActivityNewScreen}
-          initialParams={
-            initialUserId ? {userId: initialUserId} : undefined
-          }
-        />
-        <Stack.Screen name="AMCDetails" component={AMCDetailsScreen} />
-      </Stack.Navigator>
-    </NavigationContainer>
+    // SpotlightOverlay is a sibling of AppContainer, not nested inside it,
+    // so its absolute positioning lines up with the window coordinates
+    // TourTarget's measureInWindow reports (AppContainer's tablet column is
+    // narrower than the window and would otherwise offset the math).
+    <TourProvider>
+      <View style={styles.root} onStartShouldSetResponderCapture={dismissKeyboardOnTap}>
+        <AppContainer>
+          <NavigationContainer>
+            <RootNavigator />
+          </NavigationContainer>
+        </AppContainer>
+        <SpotlightOverlay />
+        {/* Java-style success / failure banner (CommonFunction.showSuccessMsg / showFailureMsg). */}
+        <ImageSourceHost />
+        <NumpadDoneBar />
+        <ToastHost />
+      </View>
+    </TourProvider>
   );
 }
+
+const styles = {
+  root: {flex: 1} as const,
+};

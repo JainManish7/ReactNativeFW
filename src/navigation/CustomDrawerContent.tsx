@@ -1,0 +1,459 @@
+// src/navigation/CustomDrawerContent.tsx
+import React from 'react';
+import { View, Text, StyleSheet, Pressable, Image, PermissionsAndroid, Platform } from 'react-native';
+import Modal from '../components/AppModal';
+import RippleTouchable from '../components/RippleTouchable';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import {
+  ItemInventoryDrawerIcon,
+  PassbookDrawerIcon,
+  AmcDrawerIcon,
+  ServicesDrawerIcon,
+  AccountsDrawerIcon,
+  LeadsDrawerIcon,
+  FieldwebAiDrawerIcon,
+  SettingsDrawerIcon,
+  RoutineServiceDrawerIcon,
+  CheckOutDrawerIcon,
+} from '../components/DrawerIcons';
+import { PencilEditIcon } from '../components/DialogIcons';
+import { DrawerContentComponentProps } from '@react-navigation/drawer';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { COLORS } from '../theme/theme';
+import { useState, useEffect } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import Geolocation from 'react-native-geolocation-service';
+import { attendanceCheckOut, getUserDetails } from '../api';
+import type { UserDetailsResultData } from '../api/users/users.types';
+import { authEvents, AUTH_CHANGED } from '../utils/authEvents';
+import { ms, sp, scale } from '../utils/responsive';
+import { setPassbookTabOrder } from '../state/passbookTabOrder';
+import { showFailureMsg, showSuccessMsg } from '../utils/toast';
+
+import {useTranslation} from 'react-i18next';
+import { tr } from '../i18n/tr';
+
+const requestLocationPermission = async (): Promise<boolean> => {
+  if (Platform.OS !== 'android') return true;
+  const granted = await PermissionsAndroid.request(
+    PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+    {
+      title: tr('Location Permission'),
+      message: tr('FieldWeb needs your location to record check-out.'),
+      buttonPositive: 'OK',
+    },
+  );
+  return granted === PermissionsAndroid.RESULTS.GRANTED;
+};
+
+const getCurrentPosition = (): Promise<{ latitude: number; longitude: number }> =>
+  new Promise((resolve, reject) => {
+    Geolocation.getCurrentPosition(
+      (position) => resolve({ latitude: position.coords.latitude, longitude: position.coords.longitude }),
+      (error) => reject(new Error(error.message || 'Unable to get current location')),
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 },
+    );
+  });
+
+export default function CustomDrawerContent({ navigation }: DrawerContentComponentProps) {
+  const {t} = useTranslation();
+  const insets = useSafeAreaInsets();
+
+  const [showLogoutModal, setShowLogoutModal] = useState(false);
+  const [showCheckOutModal, setShowCheckOutModal] = useState(false);
+  const [name, setName] = useState<string | null>(null);
+  const [profile, setProfile] = useState<UserDetailsResultData | null>(null);
+  const [phone, setPhone] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [role, setRole] = useState<string | null>(null);
+  const [photoLoadFailed, setPhotoLoadFailed] = useState(false);
+
+  const isAdmin = role?.toLowerCase() === 'admin' || role?.toLowerCase() === 'owner';
+  // Route name differs per role — see DrawerNavigator (AdminTabs → AdminStack,
+  // TechnicianTabs → TechnicianStack).
+  const tabsRoute = isAdmin ? 'AdminTabs' : 'TechnicianTabs';
+  // Stack route that hosts the tab navigator; drawer destinations are tab screens.
+  const tabsRootRoute = isAdmin ? 'AdminTabsRoot' : 'TechnicianTabsRoot';
+
+  useEffect(() => {
+    const loadSession = async () => {
+      const storedName   = await AsyncStorage.getItem('name');
+      const storedPhone  = await AsyncStorage.getItem('username');
+      const storedUserId = await AsyncStorage.getItem('uid');
+      const storedRole   = await AsyncStorage.getItem('role');
+      setName(storedName);
+      setPhone(storedPhone);
+      setUserId(storedUserId);
+      setRole(storedRole);
+
+      if (storedUserId) {
+        try {
+          // Source: HomeActivityNew.getUSerDetails() -> Api.getUserDetails(@Query("UserId"))
+          // GET Users/GetUsersByUserId — confirmed against Java: query key is "UserId", not "UserID"
+          const response = await getUserDetails({ UserId: Number(storedUserId) });
+          if (response?.ResultData) {
+            setProfile(response.ResultData);
+          }
+        } catch (e: any) {
+          console.log('Failed to load profile:', e.message);
+        }
+      }
+    };
+    loadSession();
+  }, []);
+
+  useEffect(() => {
+    setPhotoLoadFailed(false);
+  }, [profile?.Photo]);
+
+  const handleCheckOut = async () => {
+    try {
+      if (!userId) return;
+
+      const hasPermission = await requestLocationPermission();
+      if (!hasPermission) {
+        showFailureMsg(t('rn_location_permission_is_required_to_check_o'));
+        return;
+      }
+      const { latitude, longitude } = await getCurrentPosition();
+
+      // Source: HomeActivityNew.checkOut() -> Api.checkOut(UserId, Latitude, Longitude, CheckOutPlace)
+      // POST Attendance/CheckOutAttendance (form-encoded). Java resolves CheckOutPlace via
+      // MapUtils.getFullAddressFromLatLong (reverse geocoding) against a continuously-tracked
+      // last-known location; this takes a live GPS fix instead and, since no reverse-geocoding
+      // service is wired up here, falls back to raw coordinates for CheckOutPlace.
+      const response = await attendanceCheckOut({
+        UserId: Number(userId),
+        Latitude: latitude,
+        Longitude: longitude,
+        CheckOutPlace: `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`,
+      });
+      if (response?.Code === '200') {
+        setShowCheckOutModal(false);
+        // Java: showSuccessMsg(checkOut.getMessage()) -- the server text ("Check out successfully.").
+        showSuccessMsg(response?.Message || 'Check out successfully.');
+      } else {
+        showFailureMsg(response?.Message || 'Fail to check out, please try again.');
+      }
+    } catch (e: any) {
+      showFailureMsg(e?.message || 'Fail to check out, please try again.');
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      // Source: SharedPrefManager.logout() — confirmed no network call; the Java app only
+      // clears local session state, then opens the login screen. Besides token/user id it also
+      // clears user group, zone, disclaimer flag, health-safety flags, app-tour flag, permission
+      // flag, and country code/symbol — if any of those are tracked in AsyncStorage elsewhere in
+      // this app (vs. Redux/context), they should be cleared here too under their real key names.
+      await AsyncStorage.multiRemove(['token', 'uid', 'owner_id', 'name', 'username', 'role']);
+      authEvents.emit(AUTH_CHANGED);
+    } catch (err) {
+      console.log('Logout error:', err);
+    }
+  };
+
+  const AVATAR_SIZE = ms(60);
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top + ms(16) }]}>
+      {/* Profile Row */}
+      <View style={styles.profileRow}>
+        <View style={[styles.profileWrapper, { width: AVATAR_SIZE, height: AVATAR_SIZE, borderRadius: AVATAR_SIZE / 2 }]}>
+          <Image
+              source={
+                profile?.Photo && !photoLoadFailed
+                ? { uri: profile.Photo }
+                : require('../../assets/images/profile_icon.png')
+              }
+              onError={() => setPhotoLoadFailed(true)}
+              style={{ width: AVATAR_SIZE, height: AVATAR_SIZE, borderRadius: AVATAR_SIZE / 2 }}
+            />
+          <Pressable
+            style={styles.editProfile}
+            onPress={() => {
+              navigation.closeDrawer();
+              navigation.navigate(tabsRoute, { screen: tabsRootRoute, params: { screen: 'Profile' } });
+            }}
+            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+          >
+            <PencilEditIcon size={ms(16)} />
+          </Pressable>
+        </View>
+
+        <View style={styles.infoContainer}>
+          <Text style={styles.name} numberOfLines={1}>
+            {profile?.FirstName} {profile?.LastName}
+          </Text>
+          <Text style={styles.phone} numberOfLines={1}>
+            {profile?.CountryCode ? `${profile.CountryCode} ` : '+91 '}
+            {profile?.ContactNo ?? phone}
+          </Text>
+        </View>
+
+        <Pressable
+          style={styles.logoutButton}
+          onPress={() => {
+            navigation.closeDrawer();
+            setShowLogoutModal(true);
+          }}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        >
+          <Image source={require('../../assets/images/drawer_logout.png')} style={styles.logoutIcon} resizeMode="contain" />
+        </Pressable>
+      </View>
+
+      {/* Drawer Items */}
+      {(isAdmin
+        ? [
+            // `section` items render inside HomeActivityNewScreen as internal
+            // sections (not their own stack screens), so they're opened via
+            // a `drawerSection` param on the Home tab. `screen` items are
+            // AdminStack routes.
+            { icon: 'ItemInventory',                   label: t('item_inventory'),   section: 'Item Inventory' },
+            { icon: 'Passbook',                 label: t('title_passbook'),         section: 'Passbook' },
+            { icon: 'Amc',              label: t('title_amc'),              section: 'AMC' },
+            { icon: 'Services',                 label: t('title_add_services'),         section: 'Services' },
+            { icon: 'Accounts',          label: 'Accounts',         section: 'Accounts' },
+            { icon: 'Leads',                 label: 'Leads',            section: 'Leads' },
+            { icon: 'BrandPng',              label: 'Brand Management', section: 'Brand Management' },
+            { icon: 'FieldwebAi',       label: t('AI'),      screen: 'FieldWeb AI' },
+            { icon: 'DemoPng',         label: 'Book App Demo',    screen: 'Book App Demo' },
+            { icon: 'Settings',               label: t('settings'),         screen: 'Settings' },
+          ]
+        : [
+            { icon: 'ItemInventory',                   label: t('item_inventory'),  screen: 'Issued Items' },
+            { icon: 'Passbook',                   label: t('expenditure'),     screen: 'Expenditure' },
+            { icon: 'RoutineService',                   label: 'Routine Service', screen: 'Routine Service' },
+            { icon: 'FieldwebAi',       label: t('AI'),     screen: 'FieldWeb AI' },
+            { icon: 'Settings',               label: t('settings'),        screen: 'Settings' },
+            { icon: 'CheckOut',   label: t('title_check_out'),       screen: null },
+          ]
+      ).map(({ icon, label, screen, section }: any) => (
+        <DrawerItem
+          key={label}
+          icon={icon}
+          label={label}
+          onPress={() => {
+            // Close the drawer as soon as an item is picked, before
+            // navigating or opening a modal, so it doesn't linger open
+            // behind the destination screen/modal.
+            navigation.closeDrawer();
+
+            if (section) {
+              // Drill Drawer -> AdminStack -> AdminTabsRoot -> Home, passing
+              // which internal section HomeActivityNewScreen should show.
+              navigation.navigate(tabsRoute, {
+                screen: 'AdminTabsRoot',
+                params: { screen: 'Home', params: { drawerSection: section } },
+              });
+              return;
+            }
+            if (screen) {
+              if (screen === 'Expenditure') setPassbookTabOrder('expenditureFirst');
+              navigation.navigate(tabsRoute, {
+                screen: tabsRootRoute,
+                params: { screen },
+              });
+              return;
+            }
+            setShowCheckOutModal(true);
+          }}
+        />
+      ))}
+
+      {/* Logout Modal */}
+      <Modal transparent visible={showLogoutModal} animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={[styles.bottomSheet, { paddingBottom: insets.bottom + ms(16) }]}>
+            <Text style={styles.modalTitle}>{t('rn_oh_no_you_are_leaving')}{'\n'}{t('rn_are_you_sure')}</Text>
+            <Pressable
+              style={styles.confirmBtn}
+              onPress={async () => { setShowLogoutModal(false); await handleLogout(); }}
+            >
+              <Text style={styles.confirmText}>{t('title_logout').toUpperCase()}</Text>
+            </Pressable>
+            <Pressable onPress={() => setShowLogoutModal(false)}>
+              <Text style={styles.cancelText}>{t('cancel')}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Check-Out Modal */}
+      <Modal transparent visible={showCheckOutModal} animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={[styles.bottomSheet, { paddingBottom: insets.bottom + ms(16) }]}>
+            <Text style={styles.modalTitle}>{t('do_you_want_checkout')}</Text>
+            <Pressable style={styles.confirmBtn} onPress={handleCheckOut}>
+              <Text style={styles.confirmText}>{t('title_check_out').toUpperCase()}</Text>
+            </Pressable>
+            <Pressable onPress={() => setShowCheckOutModal(false)}>
+              <Text style={styles.cancelText}>{t('cancel')}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+interface DrawerItemProps {
+  icon: string;
+  label: string;
+  onPress: () => void;
+}
+
+const DRAWER_SVG_ICONS: Record<string, React.ComponentType<{ size?: number; color?: string }>> = {
+  ItemInventory: ItemInventoryDrawerIcon,
+  Passbook: PassbookDrawerIcon,
+  Amc: AmcDrawerIcon,
+  Services: ServicesDrawerIcon,
+  Accounts: AccountsDrawerIcon,
+  Leads: LeadsDrawerIcon,
+  FieldwebAi: FieldwebAiDrawerIcon,
+  Settings: SettingsDrawerIcon,
+  RoutineService: RoutineServiceDrawerIcon,
+  CheckOut: CheckOutDrawerIcon,
+};
+const DRAWER_PNG_ICONS: Record<string, any> = {
+  BrandPng: require('../../assets/images/drawer_brand.png'),
+  DemoPng: require('../../assets/images/drawer_appdemo.png'),
+};
+
+function DrawerItem({ icon, label, onPress }: DrawerItemProps) {
+  const SvgIcon = DRAWER_SVG_ICONS[icon];
+  return (
+    <RippleTouchable style={styles.item} onPress={onPress}>
+      {SvgIcon ? (
+        <SvgIcon size={ms(24)} color={COLORS.textBlack} />
+      ) : (
+        <Image source={DRAWER_PNG_ICONS[icon]} style={styles.itemIcon} resizeMode="contain" />
+      )}
+      <Text style={styles.label}>{label}</Text>
+    </RippleTouchable>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    paddingHorizontal: ms(16),
+    paddingBottom: ms(24),
+  },
+  profileRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: ms(18),
+  },
+  profileWrapper: {
+    marginRight: ms(14),
+    position: 'relative',
+    overflow: 'visible',
+  },
+  pfp: {
+    width: '100%',
+    height: '100%',
+  },
+  editProfile: {
+    position: 'absolute',
+    bottom: 0,
+    right: 0,
+  },
+  infoContainer: {
+    flex: 1,
+  },
+  name: {
+    fontSize: sp(16),
+    marginBottom: ms(2),
+    color: COLORS.ink,
+  },
+  ratingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: ms(4),
+    marginBottom: ms(2),
+  },
+  ratingText: {
+    color: COLORS.primary,
+    fontSize: sp(14),
+  },
+  phone: {
+    color: COLORS.tagBlue,
+    fontSize: sp(14),
+  },
+  logoutButton: {
+    width: ms(40),
+    height: ms(40),
+    borderRadius: ms(8),
+    backgroundColor: '#f4f4f4',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  item: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    height: ms(48),
+    paddingLeft: ms(19),
+    gap: ms(32),
+  },
+  itemIcon: {
+    width: ms(24),
+    height: ms(24),
+  },
+  logoutIcon: {
+    width: ms(24),
+    height: ms(24),
+  },
+  label: {
+    fontSize: sp(14),
+    fontWeight: '500',
+    color: COLORS.textBlack,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+  },
+  bottomSheet: {
+    backgroundColor: '#fff',
+    width: '100%',
+    maxWidth: ms(560),
+    padding: ms(20),
+    borderTopLeftRadius: ms(28),
+    borderTopRightRadius: ms(28),
+  },
+  modalTitle: {
+    fontSize: sp(18),
+    fontWeight: '400',
+    marginBottom: ms(8),
+    paddingVertical: ms(12),
+    textAlign: 'center',
+    color: COLORS.textPrimary,
+    lineHeight: sp(26),
+  },
+  confirmBtn: {
+    padding: ms(10),
+    borderRadius: ms(20),
+    backgroundColor: COLORS.primary,
+    alignItems: 'center',
+    elevation: 4,
+    minHeight: ms(50),
+    justifyContent: 'center',
+  },
+  cancelText: {
+    fontSize: sp(18),
+    color: '#8e8b8b',
+    fontWeight: '500',
+    textAlign: 'center',
+    marginTop: ms(20),
+    paddingVertical: ms(8),
+  },
+  confirmText: {
+    fontSize: sp(18),
+    color: '#fff',
+    fontWeight: '500',
+  },
+});

@@ -1,0 +1,725 @@
+// src/screens/technician/main/HomeScreen.tsx
+import {
+  View, Text, StyleSheet, FlatList,
+  Pressable, ActivityIndicator,
+} from 'react-native';
+import Modal from '../../../components/AppModal';
+import { COLORS } from '../../../theme/theme';
+import { useState, useEffect, useCallback } from 'react';
+import { useDoubleBackExit } from '../../../hooks/useDoubleBackExit';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import { attendanceCheck, addAttendance } from '../../../api/attendance/attendanceService';
+import { getTodayTaskList } from '../../../api/task/taskService';
+import { getTaskStatusCountOwnNew } from '../../../api/dashboard/dashboardService';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { getProfileDetails, getUserDetails } from '../../../api/users/usersService';
+import { getCountrySymbol } from '../../../api/countryDetails/countryDetailsService';
+import { setCurrentCountryDetails, setCurrentUserProfile } from '../../../state/session';
+import Svg, { Circle, Path } from 'react-native-svg';
+import { scale, vs, sp, ms, wps, useAppHeaderHeight } from '../../../utils/responsive';
+import TaskListCard from '../../../components/TaskListCard';
+import TaskAttachmentsSheet from '../../../components/TaskAttachmentsSheet';
+import TaskTrackingSheet from '../../../components/TaskTrackingSheet';
+import { getTaskDoc } from '../../../api/taskList/taskListService';
+import type { GetPostedTaskDocFile } from '../../../api/taskList/taskList.types';
+import type { TasksListResultData as Task } from '../../../api/task/task.types';
+import { useFocusEffect } from '@react-navigation/native';
+import { useOpenTask } from '../../../hooks/useOpenTask';
+import DisclaimerModal from '../../../components/DisclaimerModal';
+import TourTarget from '../../../tour/TourTarget';
+import {useTour} from '../../../tour/TourContext';
+import {
+  getUserDisclaimer,
+  acceptDisclaimer,
+  isDisclaimerAcceptedResponse,
+} from '../../../api/userDisclaimer/userDisclaimerService';
+import { getCurrentLocationAndAddress } from '../../../utils/locationPermision';
+import { showFailureMsg, showSuccessMsg, showToast } from '../../../utils/toast';
+import { prefetchFsrForTasks } from '../../../offline/offlineCache';
+import {usePdfDownload} from '../../../hooks/usePdfDownload';
+import {useTranslation} from 'react-i18next';
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+// ── component ─────────────────────────────────────────────────────────────────
+
+export default function HomeScreen({ navigation }: any) {
+  const {t} = useTranslation();
+  const headerHeight = useAppHeaderHeight();
+  const pdf = usePdfDownload();
+  const [filter, setFilter] = useState<'Today' | 'Week' | 'Month' | 'Year'>('Today');
+  const [dropdownVisible, setDropdownVisible] = useState(false);
+  const [showCheckInModal, setShowCheckInModal] = useState(false);
+  const [attendanceChecked, setAttendanceChecked] = useState(false);
+
+  const [token,   setToken]   = useState<string | null>(null);
+  const [userId,  setUserId]  = useState<number | null>(null);
+  const [ownerId, setOwnerId] = useState<number | null>(null);
+  const [name,    setName]    = useState<string | null>(null);
+
+  const [taskStatusCounts, setTaskStatusCounts] = useState({
+    completed: 0, ongoing: 0, inactive: 0, rejected: 0, onHold: 0, total: 0,
+  });
+
+  const [todayTasks,   setTodayTasks]   = useState<Task[]>([]);
+  const [loadingToday, setLoadingToday] = useState(false);
+  const [refreshing,   setRefreshing]   = useState(false);
+
+  const [profilePercent, setProfilePercent] = useState(0);
+  // Java hides the profile details at 100%, but the app tour spotlights this card, so keep them until it ends.
+  const {tourActive} = useTour();
+  const showProfileDetail = profilePercent !== 100 || tourActive;
+
+  // Disclaimer the technician must accept before using the app (Java: checkDisclaimer /
+  // acceptDisclaimer in HomeActivityNew, run once attendance is confirmed for the day).
+  const [disclaimerHtml, setDisclaimerHtml] = useState<string | null>(null);
+  const [disclaimerDcn, setDisclaimerDcn] = useState('');
+  const [acceptingDisclaimer, setAcceptingDisclaimer] = useState(false);
+
+  useDoubleBackExit();
+
+  // ── session ────────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    const loadSession = async () => {
+      const storedToken   = await AsyncStorage.getItem('token');
+      const storedUserId  = await AsyncStorage.getItem('uid');
+      const storedOwnerId = await AsyncStorage.getItem('owner_id');
+      const storedName    = await AsyncStorage.getItem('name');
+      setToken(storedToken);
+      setUserId(storedUserId  ? Number(storedUserId)  : null);
+      setOwnerId(storedOwnerId ? Number(storedOwnerId) : null);
+      setName(storedName);
+    };
+    loadSession();
+  }, []);
+
+  useEffect(() => {
+    if (token && userId) {
+      loadProfile();
+      loadUserDetails();
+      loadCountrySymbol();
+      if (!attendanceChecked) {
+        checkAttendance();
+        setAttendanceChecked(true);
+      }
+    }
+  }, [token, userId]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (userId) {
+        loadTodayTasks();
+        // Counts also refresh when returning from a task (accept / reject / complete)
+        // and when the Today/Week/Month/Year filter changes.
+        loadTaskCounts();
+      }
+    }, [userId, filter])
+  );
+
+  // Re-tapping the Home tab while already on it refreshes the screen.
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('tabPress', () => {
+      if (navigation.isFocused() && userId) handleRefresh();
+    });
+    return unsubscribe;
+  }, [navigation, userId]);
+
+  // ── data loaders ──────────────────────────────────────────────────────────
+
+  // GET UserDisclaimer/GetUserDisclaimer; shows the blocking modal unless already accepted.
+  const checkDisclaimer = async () => {
+    try {
+      if (!userId) return;
+      const response = await getUserDisclaimer(userId);
+
+      if (isDisclaimerAcceptedResponse(response)) {
+        setDisclaimerHtml(null);
+        return;
+      }
+      if (response?.ResultData) {
+        setDisclaimerHtml(response.ResultData.DisclaimerHtml ?? '');
+        setDisclaimerDcn(response.ResultData.DCN ?? '');
+      }
+    } catch {
+      // Java retries the check on a null response; a failed lookup here is retried the
+      // next time Home opens rather than looping.
+    }
+  };
+
+  const handleAcceptDisclaimer = async () => {
+    if (!userId) return;
+    try {
+      setAcceptingDisclaimer(true);
+      const response = await acceptDisclaimer({ UserId: userId, DCN: disclaimerDcn });
+      if (isDisclaimerAcceptedResponse(response)) {
+        setDisclaimerHtml(null);
+      } else {
+        // Java: "Unable to Accept Disclaimer" -> check again so the modal reflects the server.
+        await checkDisclaimer();
+      }
+    } catch {
+      await checkDisclaimer();
+    } finally {
+      setAcceptingDisclaimer(false);
+    }
+  };
+
+  const checkAttendance = async () => {
+    try {
+      if (!userId) return;
+      // Java HomeActivityNew.checkAttendance(): asks the server on every launch, no local flag.
+      const response = await attendanceCheck({ UserId: userId });
+      if (response?.Code === '200' && response?.Message?.toLowerCase() === 'attendance already added.') {
+        checkDisclaimer();
+      } else {
+        setShowCheckInModal(true);
+      }
+    } catch {
+      setShowCheckInModal(true);
+    }
+  };
+
+  // Mirrors Java UserDialog.showAttendanceMarkDialog(): type 2 (Present), date
+  // as yyyy-M-d, the device's coordinates and reverse-geocoded address.
+  const handleCheckIn = async () => {
+    try {
+      if (!userId) return;
+      const { coords, address } = await getCurrentLocationAndAddress();
+      const now = new Date();
+      const attendanceDate = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
+
+      const response = await addAttendance({
+        UserId: userId!,
+        AttendanceDate: attendanceDate,
+        AttendanceTypeId: 2,
+        CreatedBy: userId!,
+        UpdatedBy: userId!,
+        IsModelError: true,
+        IsSuccessful: true,
+        Latitude: coords ? String(coords.latitude) : '',
+        Longitude: coords ? String(coords.longitude) : '',
+        AttendanceMarkedPlace: address ?? 'Phone GPS is OFF',
+      });
+
+      // Java also accepts "Attendance already added." as a success.
+      const alreadyAdded = response?.Message?.toLowerCase() === 'attendance already added.';
+
+      if (response?.Code === '200') {
+        setShowCheckInModal(false);
+        if (!alreadyAdded) showSuccessMsg(t('check_in_successfully')); // Java: R.string.check_in_successfully
+        // Java: disclaimer is checked right after a successful (or already-added) check-in.
+        checkDisclaimer();
+      } else {
+        showFailureMsg(response?.Message || 'Please try again');
+      }
+    } catch (err: any) {
+      showFailureMsg(err?.message || 'Please try again');
+    }
+  };
+
+  // Java HomeActivityNew.getUSerDetails(): caches IsTeleCmiEnabled (hides customer numbers) and the
+  // state/city/pin/tag task configuration for the session.
+  const loadUserDetails = async () => {
+    try {
+      if (!userId) return;
+      const response = await getUserDetails({ UserId: userId });
+      if (response?.ResultData) setCurrentUserProfile(response.ResultData);
+    } catch {
+      // silent
+    }
+  };
+
+  const loadProfile = async () => {
+    try {
+      if (!userId) return;
+
+      // Java passes IsOnlyUserProgress=false explicitly.
+      const response = await getProfileDetails({ UserId: userId, IsOnlyUserProgress: false });
+      const profile = response?.ResultData;
+
+      if (profile) {
+        const firstName = profile.FirstName ?? '';
+        setName(firstName);
+        await AsyncStorage.setItem('name', firstName);
+
+        const pct = Number(profile.ProgressBarPercentage ?? 0);
+        setProfilePercent(Number.isFinite(pct) ? pct : 0);
+      }
+    } catch {
+      // silent
+    }
+  };
+
+  // Java's HomeActivityNew.onCreate() calls GetCountrySymbol() once per
+  // session (owner AND technician/fieldworker alike) and caches the result
+  // in SharedPrefManager -- used to prefix customer phone numbers and build
+  // WhatsApp links. Mirror that here so the technician stack has it too.
+  const loadCountrySymbol = async () => {
+    try {
+      if (!userId) return;
+
+      const response = await getCountrySymbol({ UserId: userId });
+      const resultData = response?.ResultData;
+      if (resultData) {
+        setCurrentCountryDetails(resultData.CountryCode, resultData.CurrencySymbol);
+      }
+    } catch {
+      // silent -- non-critical, same as loadProfile
+    }
+  };
+
+  const loadTaskCounts = async () => {
+    if (!userId) return;
+
+    try {
+      const response = await getTaskStatusCountOwnNew({
+        OwnerId: userId,
+        Flag: filter.toLowerCase(),
+      });
+
+      const rows = response?.ResultData || [];
+      const counts = { completed: 0, ongoing: 0, inactive: 0, rejected: 0, onHold: 0, total: 0 };
+
+      rows.forEach(row => {
+        const count = row.Taskcount ?? 0;
+        counts.total += count;
+        switch (row.Name) {
+          case 'Completed': counts.completed = count; break;
+          case 'Rejected':  counts.rejected  = count; break;
+          case 'Ongoing':   counts.ongoing   = count; break;
+          case 'InActive':  counts.inactive  = count; break;
+          case 'OnHold':    counts.onHold    = count; break;
+        }
+      });
+
+      setTaskStatusCounts(counts);
+    } catch {}
+  };
+
+  const loadTodayTasks = async () => {
+    if (!userId) return;
+    try {
+      setLoadingToday(true);
+      const response = await getTodayTaskList({ UserId: userId, pageIndex: 1, AllData: true });
+      const all: Task[] = response?.ResultData || [];
+
+      const todayStr = new Date().toDateString();
+      const filtered = all.filter(t => {
+        const d = t.TaskDate ? new Date(t.TaskDate).toDateString() : null;
+        return d === todayStr && t.TaskStatus !== 'Completed';
+      });
+
+      setTodayTasks(filtered);
+      // Download the FSR checklists now so they open offline later.
+      prefetchFsrForTasks(userId, filtered).catch(() => {});
+    } catch { /* silent */ }
+    finally { setLoadingToday(false); }
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([loadTodayTasks(), loadTaskCounts(), loadProfile()]);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // ── stats (server-computed, see loadTaskCounts) ─────────────────────────────
+
+  const {
+    completed: completedCount,
+    ongoing:   ongoingCount,
+    inactive:  inactiveCount,
+    rejected:  rejectedCount,
+    onHold:    onHoldCount,
+    total:     totalTaskCount,
+  } = taskStatusCounts;
+
+  // ── arc chart ─────────────────────────────────────────────────────────────
+
+  // tech_home_fragment_new.xml: chart column is 0.6 of the width inside 14dp margins, with
+  // 10dp padding, and FitChart strokeSize is 14dp.
+  const ARC_SIZE   = Math.round((wps(100) - ms(28)) * 0.6 - ms(20));
+  const ARC_STROKE = ms(14);
+  const ARC_CX     = ARC_SIZE / 2;
+  const ARC_CY     = ARC_SIZE / 2;
+  const ARC_RADIUS = ARC_SIZE / 2 - ARC_STROKE / 2;
+
+  // Same order as the legend; Java colours (green / orange / light_gray / colorPrimaryDark / onhold).
+  const STATUS_COLORS = [
+    COLORS.statusCompleted, COLORS.statusOngoing, COLORS.statusInactive,
+    COLORS.statusRejected, COLORS.statusOnHold,
+  ];
+
+  function polarToXY(cx: number, cy: number, r: number, angleDeg: number) {
+    const rad = ((angleDeg - 90) * Math.PI) / 180;
+    return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
+  }
+
+  function buildArc(cx: number, cy: number, r: number, startDeg: number, endDeg: number) {
+    const sweep = endDeg - startDeg;
+
+    if (sweep >= 359.99) {
+      const start = polarToXY(cx, cy, r, startDeg);
+      const mid   = polarToXY(cx, cy, r, startDeg + 180);
+      return (
+        `M ${start.x.toFixed(2)} ${start.y.toFixed(2)} ` +
+        `A ${r} ${r} 0 1 1 ${mid.x.toFixed(2)} ${mid.y.toFixed(2)} ` +
+        `A ${r} ${r} 0 1 1 ${start.x.toFixed(2)} ${start.y.toFixed(2)}`
+      );
+    }
+
+    const s = polarToXY(cx, cy, r, startDeg);
+    const e = polarToXY(cx, cy, r, endDeg);
+    return `M ${s.x.toFixed(2)} ${s.y.toFixed(2)} A ${r} ${r} 0 ${sweep > 180 ? 1 : 0} 1 ${e.x.toFixed(2)} ${e.y.toFixed(2)}`;
+  }
+
+  function TaskArcCircle({ total, completed, ongoing, inactive, rejected, onHold }: {
+    total: number; completed: number; ongoing: number;
+    inactive: number; rejected: number; onHold: number;
+  }) {
+  const {t} = useTranslation();
+    const counts = [completed, ongoing, inactive, rejected, onHold];
+    const safe   = total || 1;
+    let offset   = 0;
+    const arcs   = counts.map((count, i) => {
+      const sweep = (count / safe) * 360;
+      if (sweep <= 0) return null;
+      const path  = buildArc(ARC_CX, ARC_CY, ARC_RADIUS, offset, offset + sweep);
+      offset += sweep;
+      return { path, color: STATUS_COLORS[i] };
+    });
+    return (
+      <View style={styles.circleWrapper}>
+        <Svg width={ARC_SIZE} height={ARC_SIZE}>
+          <Circle cx={ARC_CX} cy={ARC_CY} r={ARC_RADIUS} fill="none" stroke={COLORS.tagBlue} strokeWidth={ARC_STROKE} />
+          {arcs.map((arc, i) => arc ? (
+            <Path key={i} d={arc.path} fill="none" stroke={arc.color} strokeWidth={ARC_STROKE} strokeLinecap="round" />
+          ) : null)}
+        </Svg>
+        <View style={styles.circleLabelBox} pointerEvents="none">
+          <Text style={styles.circleValue}>{total}</Text>
+          <Text style={styles.circleLabel}>{t('total_task')}</Text>
+        </View>
+      </View>
+    );
+  }
+
+  // ── task navigation ───────────────────────────
+
+  // Same routing as the Task tab (Java's tap handler is shared by both lists).
+  // Java opens the accept / resume dialog over the Home list.
+  const [tracking, setTracking] = useState<{ task: Task; resumeOnHold: boolean } | null>(null);
+  const openTask = useOpenTask(navigation, {
+    onOpenTracking: (t, options) => setTracking({ task: t, resumeOnHold: !!options?.resumeOnHold }),
+    // Java rejects an InActive task more than 3 days old instead of accepting it;
+    // TaskTracking opens directly on its reject step for that case.
+    onLateInactive: t => navigation.navigate('TaskTracking', { task: t, autoReject: true }),
+  });
+
+  // ── attachments (same as the Task tab: InActive / Completed cards show the clip icon) ──
+
+  const [attachmentFiles, setAttachmentFiles] = useState<GetPostedTaskDocFile[]>([]);
+  const [attachmentTask, setAttachmentTask] = useState<Task | null>(null);
+
+  const handleViewAttachments = async (task: Task) => {
+    if (!userId) return;
+    try {
+      const response = await getTaskDoc({
+        userId: Number(userId),
+        taskId: task.TaskStatus === 'InActive' ? 0 : task.Id,
+        customerId: task.CustomerDetailsid,
+      });
+      const files = response?.ResultData?.Files ?? [];
+      if (files.length === 0) {
+        showToast(t('rn_you_have_no_attachment'));
+        return;
+      }
+      setAttachmentFiles(files);
+      setAttachmentTask(task);
+    } catch {
+      showToast(t('rn_you_have_no_attachment'));
+    }
+  };
+
+  const handleDownloadFile = async (url: string) => {
+    await pdf.openFile(url, 'Attachment');
+  };
+
+  // ── task card ─────────────────────────────────────────────────────────────
+
+  const renderTaskCard = ({ item }: { item: Task }) => (
+    <View style={styles.cardWrap}>
+      <TaskListCard
+        task={item}
+        onPress={() => openTask(item)}
+        actions={
+          item.TaskStatus === 'InActive' || item.TaskStatus === 'Completed' ? (
+            <Pressable onPress={() => handleViewAttachments(item)} hitSlop={8} style={styles.actionIcon}>
+              <Ionicons name="attach" size={ms(20)} color={COLORS.primary} />
+            </Pressable>
+          ) : null
+        }
+      />
+    </View>
+  );
+
+  // ── date label for stats header ───────────────────────────────────────────
+
+  const dateLabel = (() => {
+    const fmt = (d: Date) => d.toLocaleDateString('en-GB').replace(/\//g, '-');
+    const today = new Date();
+    if (filter === 'Today') return fmt(today);
+    if (filter === 'Week') {
+      const start = new Date();
+      const day = start.getDay();
+      const diffToMonday = day === 0 ? -6 : 1 - day;
+      start.setDate(start.getDate() + diffToMonday);
+      return `${fmt(start)} to ${fmt(today)}`;
+    }
+    if (filter === 'Month') {
+      return `${fmt(new Date(today.getFullYear(), today.getMonth(), 1))} to ${fmt(today)}`;
+    }
+    return `${fmt(new Date(today.getFullYear(), 0, 1))} to ${fmt(today)}`;
+  })();
+
+  // ── render ────────────────────────────────────────────────────────────────
+
+  return (
+    <View style={styles.root}>
+      <View style={[styles.redBg, { height: headerHeight }]} />
+
+      {/* Greeting row */}
+      <View style={styles.greetingRow}>
+        <Text style={styles.headerGreeting}>{t('rn_hello')}, {name ?? '...'}</Text>
+        <Pressable style={styles.filterButton} onPress={() => setDropdownVisible(true)}>
+          <Text style={styles.headerSub}>{filter}</Text>
+          <Ionicons name="chevron-down" size={sp(20)} color="#FEE2E2" />
+        </Pressable>
+      </View>
+
+      {/* White sheet */}
+      <FlatList
+        data={todayTasks}
+        keyExtractor={(item) => String(item.Id)}
+        renderItem={renderTaskCard}
+        contentContainerStyle={styles.whiteSheet}
+        showsVerticalScrollIndicator={false}
+        refreshing={refreshing}
+        onRefresh={handleRefresh}
+        ListHeaderComponent={
+          <>
+            {/* Profile completion (Java hides the whole row once the profile is 100%).
+                Only the app tour brings it back, so it can be spotlighted. */}
+            {showProfileDetail && (
+              <>
+                <View style={styles.profileRow}>
+                  <Pressable onPress={() => navigation.navigate('Profile')} style={styles.profileLeft}>
+                    {/* Left-side label is the tour target, so the spotlight sits over it. */}
+                    <TourTarget tourKey="profileCompletion">
+                      <Text style={styles.profileTitle}>{t('profile_completion')}</Text>
+                    </TourTarget>
+                    <Text style={styles.profileUpdate}>{t('update')}</Text>
+                  </Pressable>
+                  <Text style={styles.profilePercentText}>{profilePercent.toFixed(1)}%</Text>
+                </View>
+                <View style={styles.progressBar}>
+                  <View style={[styles.progressFill, { width: `${profilePercent}%` }]} />
+                </View>
+              </>
+            )}
+
+            {/* Date label */}
+            <View style={styles.dateRow}>
+              <Text style={styles.dateLabelText}>{t('showing_data_for')}</Text>
+              <Text style={styles.dateValueText}>{dateLabel}</Text>
+            </View>
+
+            {/* Arc + stats */}
+            <View style={styles.statsRow}>
+              <View style={styles.chartCol}>
+                <TaskArcCircle
+                  total={totalTaskCount}
+                  completed={completedCount}
+                  ongoing={ongoingCount}
+                  inactive={inactiveCount}
+                  rejected={rejectedCount}
+                  onHold={onHoldCount}
+                />
+              </View>
+              <View style={styles.stats}>
+                {[
+                  { count: completedCount, label: t('completed'), color: COLORS.statusCompleted },
+                  { count: ongoingCount,   label: t('ongoing'),   color: COLORS.statusOngoing },
+                  { count: inactiveCount,  label: t('inactive'),  color: COLORS.lightGray },
+                  { count: rejectedCount,  label: t('rejected'),  color: COLORS.statusRejected },
+                  { count: onHoldCount,    label: t('onhold'),    color: COLORS.statusOnHold },
+                ].map((row, i) => (
+                  <View key={row.label} style={[styles.statRow, i > 0 && styles.statGap]}>
+                    <Text style={[styles.statCount, { color: row.color }]}>
+                      {String(row.count).padStart(2, '0')}
+                    </Text>
+                    <Text style={[styles.statLabel, { color: row.color }]}>{row.label}</Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+
+            {/* Divider before task list */}
+            <View style={styles.divider} />
+
+            {/* Loading indicator */}
+            {loadingToday && (
+              <ActivityIndicator
+                color={COLORS.primary}
+                size="small"
+                style={{ marginVertical: vs(12) }}
+              />
+            )}
+          </>
+        }
+        ListEmptyComponent={
+          !loadingToday ? (
+            <Text style={styles.emptyText}>{t('rn_no_tasks_for_today')}</Text>
+          ) : null
+        }
+      />
+
+      {/* Filter dropdown */}
+      <Modal
+        visible={dropdownVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setDropdownVisible(false)}
+      >
+        <Pressable style={StyleSheet.absoluteFill} onPress={() => setDropdownVisible(false)} />
+        <View style={[styles.dropdown, { top: headerHeight + vs(42) }]}>
+          {(['Today', 'Week', 'Month', 'Year'] as const).map((item) => (
+            <Pressable
+              key={item}
+              style={styles.dropdownItem}
+              onPress={() => { setFilter(item); setDropdownVisible(false); }}
+            >
+              <Text style={styles.dropdownText}>{item}</Text>
+            </Pressable>
+          ))}
+        </View>
+      </Modal>
+
+      {/* Disclaimer (blocking until accepted) */}
+      <DisclaimerModal
+        visible={!!disclaimerHtml}
+        disclaimerHtml={disclaimerHtml ?? ''}
+        loading={acceptingDisclaimer}
+        onAccept={handleAcceptDisclaimer}
+      />
+
+      {/* Check-in modal */}
+      <Modal transparent visible={showCheckInModal} animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.bottomSheet}>
+            <Text style={styles.modalTitle}>{t('check_in_for')}</Text>
+            <Text style={styles.modalDate}>
+              {new Date().toLocaleDateString('en-GB', {
+                day: '2-digit', month: 'long', year: 'numeric',
+              })}
+            </Text>
+            <Pressable style={styles.confirmBtn} onPress={handleCheckIn}>
+              <Text style={styles.confirmText}>{t('rn_check_in_2')}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      {tracking && (
+        <TaskTrackingSheet
+          task={tracking.task}
+          resumeOnHold={tracking.resumeOnHold}
+          navigation={navigation}
+          onClose={() => setTracking(null)}
+          onFinished={() => setTracking(null)}
+          onRejected={() => { loadTodayTasks(); loadTaskCounts(); }}
+        />
+      )}
+
+      <TaskAttachmentsSheet
+        visible={attachmentTask !== null}
+        taskName={attachmentTask?.Name}
+        files={attachmentFiles}
+        onClose={() => setAttachmentTask(null)}
+        onDownload={handleDownloadFile}
+      />
+
+      {/* In-app download overlay and PDF viewer. */}
+      {pdf.modals}
+    </View>
+  );
+}
+
+// ── styles ────────────────────────────────────────────────────────────────────
+
+const styles = StyleSheet.create({
+  root:           { flex: 1, backgroundColor: COLORS.primary },
+  redBg:          { backgroundColor: COLORS.primary },
+
+  // tech_home_fragment_new.xml: white CardView, 30dp corners, 10dp top padding.
+  whiteSheet: {
+    backgroundColor: COLORS.white,
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+    paddingTop: ms(10),
+    paddingBottom: ms(56),
+    flexGrow: 1,
+  },
+
+  greetingRow:    { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: scale(20), paddingVertical: vs(10), minHeight: vs(50) },
+  headerGreeting: { fontSize: sp(20), fontWeight: '500', color: '#fff' },
+  filterButton:   { flexDirection: 'row', alignItems: 'center', gap: scale(8) },
+  headerSub:      { fontSize: sp(18), color: COLORS.white },
+
+  dropdown:     { position: 'absolute', right: scale(18), backgroundColor: '#fff', width: scale(140), elevation: 6, borderRadius: scale(8), shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.15, shadowRadius: 4 },
+  dropdownItem: { padding: scale(12) },
+  dropdownText: { fontSize: sp(14) },
+
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end', alignItems: 'center' },
+  bottomSheet:  { backgroundColor: '#fff', width: '100%', maxWidth: scale(560), padding: scale(20), borderTopLeftRadius: scale(28), borderTopRightRadius: scale(28), minHeight: vs(230), justifyContent: 'center' },
+  modalTitle:   { fontSize: sp(20), paddingVertical: vs(15), textAlign: 'center' },
+  modalDate:    { fontSize: sp(26), textAlign: 'center', marginBottom: vs(30), fontWeight: '400' },
+  confirmBtn:   { padding: scale(10), borderRadius: scale(30), backgroundColor: COLORS.primary, alignItems: 'center', justifyContent: 'center', height: vs(56) },
+  confirmText:  { fontSize: sp(20), color: '#fff' },
+
+  profileRow:          { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginHorizontal: ms(14) },
+  profileLeft:         { flexDirection: 'row', alignItems: 'center' },
+  profileTitle:        { fontSize: sp(14), fontWeight: 'bold', color: COLORS.textBlack },
+  profileUpdate:       { marginLeft: ms(6), fontSize: sp(14), fontWeight: 'bold', color: COLORS.primary },
+  profilePercentText:  { fontSize: sp(14), fontWeight: 'bold', color: COLORS.textBlack },
+  progressBar:         { height: ms(5), margin: ms(10), borderRadius: ms(34), overflow: 'hidden', backgroundColor: COLORS.lighterGray },
+  progressFill:        { height: ms(5), backgroundColor: COLORS.primary, borderRadius: ms(34) },
+
+  dateRow:       { flexDirection: 'row', marginHorizontal: ms(14) },
+  dateLabelText: { fontSize: sp(14), color: COLORS.textMuted },
+  dateValueText: { marginLeft: ms(5), fontSize: sp(14), color: COLORS.ink },
+
+  statsRow:       { flexDirection: 'row', marginHorizontal: ms(14) },
+  chartCol:       { flex: 0.6, marginTop: ms(10), padding: ms(10), alignItems: 'center', justifyContent: 'center' },
+  circleWrapper:  { alignItems: 'center', justifyContent: 'center' },
+  circleValue:    { fontSize: sp(32), fontWeight: 'bold', color: COLORS.textBlack },
+  circleLabel:    { fontSize: sp(15), color: COLORS.textMuted },
+  circleLabelBox: { position: 'absolute', alignItems: 'center' },
+
+  stats:     { flex: 0.4, justifyContent: 'center', paddingLeft: ms(30) },
+  statRow:   { flexDirection: 'row', alignItems: 'baseline' },
+  statGap:   { marginTop: ms(20) },
+  statCount: { fontSize: sp(15), fontWeight: 'bold' },
+  statLabel: { marginLeft: ms(10), fontSize: sp(13), fontWeight: 'bold' },
+
+  // 10dp lighter_gray band between the stats and the task list.
+  divider: { height: ms(10), marginVertical: ms(10), backgroundColor: COLORS.lighterGray },
+
+  cardWrap: { marginHorizontal: ms(14) },
+  actionIcon: { marginRight: ms(8) },
+
+  emptyText: { textAlign: 'center', color: '#9ca3af', fontSize: sp(14), marginTop: vs(24) },
+});

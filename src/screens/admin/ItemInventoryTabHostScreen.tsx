@@ -1,0 +1,2514 @@
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {useConfirmDelete} from '../../components/ConfirmDeleteDialog';
+import {ms, sp} from '../../utils/responsive';
+import {
+  ActivityIndicator,
+  BackHandler,
+  ScrollView,
+  FlatList,
+  Image,
+  Pressable,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import Modal from '../../components/AppModal';
+import {
+  type AssignedItemListItem,
+  type AssignedItemListResponse,
+  type ItemInventoryListItem,
+  type ItemInventoryListResponse,
+  type UsedItemListItem,
+  type UsedItemListResponse,
+} from './adminLegacyApiTypes';
+import { getAllLargeItemList, getAllAssignItemlistTechwise, getUsedItemlist, getDeleteItemPortal, returnItem } from '../../api/item/itemService';
+import { ensureSuccess } from '../../utils/apiResponse';
+import UsedItemUpdateModal from './UsedItemUpdateModal';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import type { GetUsedItemListResultData } from '../../api/item/item.types';
+import { formatAmount } from '../../utils/decimal';
+import AddItemModal from './AddItemModal';
+import AssignItemModal from './AssignItemModal';
+import FOCScreen from './FOCScreen';
+import FOCDetailsScreen from '../technician/drawer/FOCDetailsScreen';
+import {useNavigation} from '@react-navigation/native';
+import {setHeaderBack} from '../../state/headerBack';
+import {getCurrentCurrencySymbol} from '../../state/session';
+import TabStrip from '../../components/TabStrip';
+import {COLORS} from '../../theme/theme';
+import {
+  EditSquareIcon,
+  ItemOptionIcon as JavaItemOptionIcon,
+  DeleteAccIcon,
+  DefaultItemIcon as JavaDefaultItemIcon,
+  IssueItemDialogIcon,
+  NoImageCameraIcon,
+  ReturnIcon,
+} from '../../components/JavaIcons';
+import { showFailureMsg } from '../../utils/toast';
+import DecimalInput from '../../components/DecimalInput';
+
+import {useTranslation} from 'react-i18next';
+import {tr, trf} from '../../i18n/tr';
+type ItemInventoryTabHostScreenProps = {
+  ownerId: number;
+  isFieldWorker?: boolean;
+};
+
+type InventoryTabKey = 'primary' | 'requested';
+type ItemInventoryView = 'list' | 'detail' | 'issued' | 'used';
+
+type InventoryTab = {
+  key: InventoryTabKey;
+  label: string;
+};
+
+type FetchItemPageOptions = {
+  nextPage: number;
+  replace: boolean;
+  refreshing?: boolean;
+  searchParam?: string;
+};
+
+const PAGE_START = 1;
+const ITEM_SEARCH_LIMIT = 25;
+const THEME_PRIMARY = '#c3002f';
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const isItemRecord = (value: unknown): value is ItemInventoryListItem => {
+  if (!isRecord(value) || Array.isArray(value)) {
+    return false;
+  }
+
+  return [
+    'id',
+    'Id',
+    'itemId',
+    'ItemId',
+    'name',
+    'Name',
+    'itemName',
+    'ItemName',
+  ].some(key => value[key] !== undefined && value[key] !== null);
+};
+
+const isAssignedItemRecord = (value: unknown): value is AssignedItemListItem =>
+  isRecord(value) && !Array.isArray(value);
+
+const isUsedItemRecord = (value: unknown): value is UsedItemListItem =>
+  isRecord(value) && !Array.isArray(value);
+
+const getItemResultData = (
+  response: ItemInventoryListResponse,
+): ItemInventoryListItem[] => {
+  const payload = response.resultData ?? response.ResultData;
+
+  if (Array.isArray(payload)) {
+    return payload.filter(isItemRecord);
+  }
+
+  if (isItemRecord(payload)) {
+    return [payload];
+  }
+
+  if (isItemRecord(response)) {
+    return [response];
+  }
+
+  return [];
+};
+
+const getAssignedResultData = (
+  response: AssignedItemListResponse,
+): AssignedItemListItem[] => {
+  const payload = response.resultData ?? response.ResultData;
+
+  if (Array.isArray(payload)) {
+    return payload.filter(isAssignedItemRecord);
+  }
+
+  if (isAssignedItemRecord(payload)) {
+    return [payload];
+  }
+
+  if (isAssignedItemRecord(response)) {
+    return [response];
+  }
+
+  return [];
+};
+
+const getUsedResultData = (
+  response: UsedItemListResponse,
+): UsedItemListItem[] => {
+  const payload = response.resultData ?? response.ResultData;
+
+  if (Array.isArray(payload)) {
+    return payload.filter(isUsedItemRecord);
+  }
+
+  if (isUsedItemRecord(payload)) {
+    return [payload];
+  }
+
+  if (isUsedItemRecord(response)) {
+    return [response];
+  }
+
+  return [];
+};
+
+const getItemCode = (response: ItemInventoryListResponse) =>
+  String(response.code ?? response.Code ?? '');
+
+const getItemMessage = (response: ItemInventoryListResponse) =>
+  String(response.message ?? response.Message ?? '').trim();
+
+const getAssignedCode = (response: AssignedItemListResponse) =>
+  String(response.code ?? response.Code ?? '');
+
+const getAssignedMessage = (response: AssignedItemListResponse) =>
+  String(response.message ?? response.Message ?? '').trim();
+
+const getUsedCode = (response: UsedItemListResponse) =>
+  String(response.code ?? response.Code ?? '');
+
+const getUsedMessage = (response: UsedItemListResponse) =>
+  String(response.message ?? response.Message ?? '').trim();
+
+const getItemString = (
+  item: ItemInventoryListItem,
+  camelKey: keyof ItemInventoryListItem,
+  pascalKey: keyof ItemInventoryListItem,
+) => {
+  const value = item[camelKey] ?? item[pascalKey];
+  return typeof value === 'string' ? value.trim() : '';
+};
+
+const getItemStringFromKeys = (
+  item: ItemInventoryListItem,
+  keys: Array<keyof ItemInventoryListItem>,
+) => {
+  for (const key of keys) {
+    const value = item[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return String(value);
+    }
+  }
+
+  return '';
+};
+
+const getAssignedString = (
+  item: AssignedItemListItem,
+  keys: Array<keyof AssignedItemListItem>,
+) => {
+  for (const key of keys) {
+    const value = item[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return String(value);
+    }
+  }
+
+  return '';
+};
+
+const getUsedString = (
+  item: UsedItemListItem,
+  keys: Array<keyof UsedItemListItem>,
+) => {
+  for (const key of keys) {
+    const value = item[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return String(value);
+    }
+  }
+
+  return '';
+};
+
+const getItemNumber = (
+  item: ItemInventoryListItem,
+  keys: Array<keyof ItemInventoryListItem>,
+) => {
+  for (const key of keys) {
+    const value = item[key];
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return 0;
+};
+
+const getAssignedNumber = (
+  item: AssignedItemListItem,
+  keys: Array<keyof AssignedItemListItem>,
+) => {
+  for (const key of keys) {
+    const value = item[key];
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return 0;
+};
+
+const getUsedNumber = (
+  item: UsedItemListItem,
+  keys: Array<keyof UsedItemListItem>,
+) => {
+  for (const key of keys) {
+    const value = item[key];
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return 0;
+};
+
+const getItemId = (item: ItemInventoryListItem) =>
+  getItemNumber(item, ['id', 'Id', 'itemId', 'ItemId']);
+
+const getItemName = (item: ItemInventoryListItem) =>
+  getItemString(item, 'name', 'Name') ||
+  getItemString(item, 'itemName', 'ItemName') ||
+  `Item #${getItemId(item) || '-'}`;
+
+const getItemDescription = (item: ItemInventoryListItem) =>
+  getItemString(item, 'description', 'Description') ||
+  getItemString(item, 'note', 'Note') ||
+  'No description';
+
+const getItemUnit = (item: ItemInventoryListItem) =>
+  getItemString(item, 'unitName', 'UnitName') ||
+  getItemString(item, 'itemUnitName', 'ItemUnitName') ||
+  getItemString(item, 'itemUnitTypeName', 'ItemUnitTypeName') ||
+  getItemString(item, 'itemUnit', 'ItemUnit') ||
+  getItemString(item, 'unit', 'Unit') ||
+  'piece';
+
+const getAvailableQuantity = (item: ItemInventoryListItem) =>
+  getItemNumber(item, [
+    'unAssignedQuantity',
+    'UnAssignedQuantity',
+    'availableQuantity',
+    'AvailableQuantity',
+    'availableQty',
+    'AvailableQty',
+    'quantity',
+    'Quantity',
+  ]);
+
+const getIssuedQuantity = (item: ItemInventoryListItem) =>
+  getItemNumber(item, [
+    'issuedQuantity',
+    'IssuedQuantity',
+    'issuedQty',
+    'IssuedQty',
+    'assignedQuantity',
+    'AssignedQuantity',
+  ]);
+
+const getUsedQuantity = (item: ItemInventoryListItem) =>
+  getItemNumber(item, ['usedQuantity', 'UsedQuantity', 'usedQty', 'UsedQty']) ||
+  Number(
+    item.usedItemDetailsDtoObj?.usedQty ??
+      item.usedItemDetailsDtoObj?.UsedQty ??
+      item.UsedItemDetailsDtoObj?.usedQty ??
+      item.UsedItemDetailsDtoObj?.UsedQty ??
+      0,
+  ) ||
+  0;
+
+const getImageUri = (item: ItemInventoryListItem) =>
+  getItemString(item, 'itemImagePath', 'ItemImagePath') ||
+  getItemString(item, 'imageUrl', 'ImageUrl') ||
+  getItemString(item, 'itemImageUrl', 'ItemImageUrl') ||
+  getItemString(item, 'itemImage', 'ItemImage') ||
+  getItemString(item, 'image', 'Image');
+
+const getSafeImageUri = (item: ItemInventoryListItem) => {
+  const imageUri = getImageUri(item);
+  if (
+    imageUri &&
+    /^(https?:\/\/|file:\/\/|content:\/\/|data:image\/)/i.test(imageUri)
+  ) {
+    return imageUri;
+  }
+
+  return '';
+};
+
+const getItemCodeValue = (item: ItemInventoryListItem) =>
+  getItemString(item, 'serialNumber', 'SerialNumber') ||
+  getItemStringFromKeys(item, ['itemId', 'ItemId']) ||
+  'NA';
+
+const getItemHsnCode = (item: ItemInventoryListItem) =>
+  getItemString(item, 'hsnCode', 'HSNCode') || 'NA';
+
+const getItemGroupName = (item: ItemInventoryListItem) =>
+  getItemString(item, 'itemGroupName', 'ItemGroupName') || 'NA';
+
+const getPurchasePrice = (item: ItemInventoryListItem) =>
+  getItemNumber(item, ['purchasePrice', 'PurchasePrice']);
+
+const getSalesPrice = (item: ItemInventoryListItem) =>
+  getItemNumber(item, ['salesPrice', 'SalesPrice']);
+
+const formatCurrency = (value: number) =>
+  `${(() => { const s = getCurrentCurrencySymbol(); return !s || s === 'Rs.' ? '₹' : s; })()} ${formatAmount(value)}`;
+
+const getAssignedTaskId = (item: AssignedItemListItem) => {
+  const id = getAssignedString(item, ['newTaskID', 'NewTaskID', 'taskId', 'TaskId']);
+  return !id || id === '0' ? 'NA' : id;
+};
+
+const getAssignedQuantity = (item: AssignedItemListItem) =>
+  getAssignedNumber(item, [
+    'quantity',
+    'Quantity',
+    'issuedQuantity',
+    'IssuedQuantity',
+    'assignedQuantity',
+    'AssignedQuantity',
+  ]);
+
+const getUsedItemName = (item: UsedItemListItem) =>
+  getUsedString(item, ['itemName', 'ItemName', 'name', 'Name']);
+
+const getUsedDetailQuantity = (item: UsedItemListItem) =>
+  getUsedNumber(item, [
+    'usedQty',
+    'UsedQty',
+    'usedQuantity',
+    'UsedQuantity',
+    'quantity',
+    'Quantity',
+  ]);
+
+const getUsedTaskId = (item: UsedItemListItem) =>
+  getUsedString(item, ['newTaskID', 'NewTaskID', 'taskId', 'TaskId']) || '-';
+
+const getAssignedFieldWorkerName = (item: AssignedItemListItem) => {
+  const fullName = `${getAssignedString(item, ['firstName', 'FirstName'])} ${getAssignedString(
+    item,
+    ['lastName', 'LastName'],
+  )}`.trim();
+
+  return (
+    getAssignedString(item, [
+      'techFullName',
+      'TechFullName',
+      'fieldWorkerName',
+      'FieldWorkerName',
+      'employeeName',
+      'EmployeeName',
+      'userName',
+      'UserName',
+      'name',
+      'Name',
+    ]) ||
+    fullName ||
+    'Fieldworker'
+  );
+};
+
+const getUsedFieldWorkerName = (item: UsedItemListItem) => {
+  const fullName = `${getUsedString(item, ['firstName', 'FirstName'])} ${getUsedString(
+    item,
+    ['lastName', 'LastName'],
+  )}`.trim();
+
+  return (
+    getUsedString(item, [
+      'techFullName',
+      'TechFullName',
+      'fieldWorkerName',
+      'FieldWorkerName',
+      'employeeName',
+      'EmployeeName',
+      'userName',
+      'UserName',
+      'name',
+      'Name',
+    ]) ||
+    fullName ||
+    'Fieldworker'
+  );
+};
+
+const formatItemDate = (item: ItemInventoryListItem) => {
+  const displayDate = getItemString(item, 'updatedBy', 'UpdatedBy');
+  if (displayDate && !displayDate.includes('0001-01-01')) {
+    return displayDate;
+  }
+
+  const rawDate = getItemString(item, 'createdDate', 'CreatedDate');
+  const parsedDate = new Date(rawDate);
+  if (!rawDate || Number.isNaN(parsedDate.getTime())) {
+    return rawDate || 'NA';
+  }
+
+  return parsedDate.toLocaleDateString('en-GB');
+};
+
+const isItemSuccessOrNoData = (response: ItemInventoryListResponse) => {
+  const code = getItemCode(response);
+  return code === '200' || code === '500' || code === '';
+};
+
+const isAssignedSuccessOrNoData = (response: AssignedItemListResponse) => {
+  const code = getAssignedCode(response);
+  return code === '200' || code === '500' || code === '';
+};
+
+const isUsedSuccessOrNoData = (response: UsedItemListResponse) => {
+  const code = getUsedCode(response);
+  return code === '200' || code === '500' || code === '';
+};
+
+const EditIcon = ({color = THEME_PRIMARY}: {color?: string}) => (
+  <View style={styles.iconFrame}>
+    <View style={[styles.editBox, {borderColor: color}]} />
+    <View style={[styles.editPencil, {backgroundColor: color}]} />
+    <View style={[styles.editPencilTip, {borderLeftColor: color}]} />
+  </View>
+);
+
+const ItemOptionIcon = ({color = THEME_PRIMARY}: {color?: string}) => (
+  <View style={styles.iconFrame}>
+    <View style={[styles.optionBox, {borderColor: color}]} />
+    <View style={[styles.optionLid, {backgroundColor: color}]} />
+    <View style={[styles.optionCheckStem, {backgroundColor: color}]} />
+    <View style={[styles.optionCheckArm, {backgroundColor: color}]} />
+  </View>
+);
+
+const DeleteIcon = ({color = THEME_PRIMARY}: {color?: string}) => (
+  <View style={styles.iconFrame}>
+    <View style={[styles.deleteLid, {backgroundColor: color}]} />
+    <View style={[styles.deleteBin, {borderColor: color}]}>
+      <View style={[styles.deleteLine, {backgroundColor: color}]} />
+      <View style={[styles.deleteLine, {backgroundColor: color}]} />
+    </View>
+  </View>
+);
+
+const DefaultItemIcon = ({color = THEME_PRIMARY}: {color?: string}) => (
+  <View style={styles.defaultItemIcon}>
+    <View style={[styles.defaultItemBoxTop, {backgroundColor: color}]} />
+    <View style={[styles.defaultItemBoxFace, {borderColor: color}]} />
+    <View style={[styles.defaultItemBoxSide, {backgroundColor: color}]} />
+  </View>
+);
+
+const ItemInventoryTabHostScreen = ({
+  ownerId,
+  isFieldWorker = false,
+}: ItemInventoryTabHostScreenProps) => {
+  const {t} = useTranslation();
+  const {askDelete, deleteDialog} = useConfirmDelete();
+  const [activeTab, setActiveTab] = useState<InventoryTabKey>('primary');
+  // Row actions (Java ItemListAdapterNew): edit, assign, delete; plus return
+  // on an assigned row (ItemInventoryAdapter -> ItemDialog.updateReturnItem).
+  const [editingItem, setEditingItem] = useState<ItemInventoryListItem | null>(null);
+  const [assigningItem, setAssigningItem] = useState<ItemInventoryListItem | null>(null);
+  const [isAddingItem, setIsAddingItem] = useState(false);
+  const [returningRow, setReturningRow] = useState<AssignedItemListItem | null>(null);
+  const [returnQuantity, setReturnQuantity] = useState('0');
+  const [returnNotes, setReturnNotes] = useState('');
+  const [isReturning, setIsReturning] = useState(false);
+  const [items, setItems] = useState<ItemInventoryListItem[]>([]);
+  const [itemSearchText, setItemSearchText] = useState('');
+  const [submittedItemSearch, setSubmittedItemSearch] = useState('');
+  const [itemPageIndex, setItemPageIndex] = useState(PAGE_START);
+  const [isItemInitialLoading, setIsItemInitialLoading] = useState(false);
+  const [isItemRefreshing, setIsItemRefreshing] = useState(false);
+  const [isItemLoadingMore, setIsItemLoadingMore] = useState(false);
+  const [isItemLastPage, setIsItemLastPage] = useState(false);
+  const [itemErrorMessage, setItemErrorMessage] = useState('');
+  const [inventoryView, setInventoryView] = useState<ItemInventoryView>('list');
+  const [selectedItem, setSelectedItem] = useState<ItemInventoryListItem | null>(
+    null,
+  );
+  const navigation = useNavigation();
+  const [focDetail, setFocDetail] = useState<Record<string, unknown> | null>(null);
+  const [isItemDetailLoading, setIsItemDetailLoading] = useState(false);
+  const [itemDetailErrorMessage, setItemDetailErrorMessage] = useState('');
+  const [assignedItems, setAssignedItems] = useState<AssignedItemListItem[]>([]);
+  const [assignedSearchText, setAssignedSearchText] = useState('');
+  const [isAssignedLoading, setIsAssignedLoading] = useState(false);
+  const [assignedErrorMessage, setAssignedErrorMessage] = useState('');
+  const [usedItems, setUsedItems] = useState<UsedItemListItem[]>([]);
+  const [usedSearchText, setUsedSearchText] = useState('');
+  const [isUsedLoading, setIsUsedLoading] = useState(false);
+  const [usedErrorMessage, setUsedErrorMessage] = useState('');
+  const latestItemRequestId = useRef(0);
+  const latestItemDetailRequestId = useRef(0);
+  const latestAssignedRequestId = useRef(0);
+  const latestUsedRequestId = useRef(0);
+
+  const closeItemDetail = useCallback(() => {
+    latestItemDetailRequestId.current += 1;
+    latestAssignedRequestId.current += 1;
+    latestUsedRequestId.current += 1;
+    setSelectedItem(null);
+    setInventoryView('list');
+    setItemDetailErrorMessage('');
+    setIsItemDetailLoading(false);
+    setAssignedItems([]);
+    setAssignedSearchText('');
+    setAssignedErrorMessage('');
+    setIsAssignedLoading(false);
+    setUsedItems([]);
+    setUsedSearchText('');
+    setUsedErrorMessage('');
+    setIsUsedLoading(false);
+  }, []);
+
+  const closeIssuedDetails = useCallback(() => {
+    latestAssignedRequestId.current += 1;
+    setInventoryView('detail');
+    setAssignedSearchText('');
+    setAssignedErrorMessage('');
+    setIsAssignedLoading(false);
+  }, []);
+
+  const closeUsedDetails = useCallback(() => {
+    latestUsedRequestId.current += 1;
+    setInventoryView('detail');
+    setUsedSearchText('');
+    setUsedErrorMessage('');
+    setIsUsedLoading(false);
+  }, []);
+
+  // Header back arrow (iOS has no hardware back): active while any sub-view is open.
+  useEffect(() => {
+    let back: (() => void) | null = null;
+    if (focDetail) {
+      back = () => setFocDetail(null);
+    } else if (selectedItem && inventoryView === 'issued') {
+      back = closeIssuedDetails;
+    } else if (selectedItem && inventoryView === 'used') {
+      back = closeUsedDetails;
+    } else if (selectedItem && inventoryView !== 'list') {
+      back = closeItemDetail;
+    }
+    setHeaderBack(back);
+    return () => setHeaderBack(null);
+  }, [focDetail, selectedItem, inventoryView, closeIssuedDetails, closeUsedDetails, closeItemDetail]);
+
+  useEffect(() => {
+    if (!focDetail) {
+      return undefined;
+    }
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      setFocDetail(null);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [focDetail]);
+
+  useEffect(() => {
+    if (!selectedItem || inventoryView === 'list') {
+      return undefined;
+    }
+
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (inventoryView === 'issued') {
+        closeIssuedDetails();
+      } else if (inventoryView === 'used') {
+        closeUsedDetails();
+      } else {
+        closeItemDetail();
+      }
+      return true;
+    });
+
+    return () => subscription.remove();
+  }, [
+    closeIssuedDetails,
+    closeItemDetail,
+    closeUsedDetails,
+    inventoryView,
+    selectedItem,
+  ]);
+
+  const tabs = useMemo<InventoryTab[]>(
+    () => [
+      {
+        key: 'primary',
+        label: isFieldWorker ? 'Issued Items' : 'Item List',
+      },
+      {
+        key: 'requested',
+        label: t('requested_items'),
+      },
+    ],
+    [isFieldWorker],
+  );
+
+  const fetchItemPage = useCallback(
+    async ({
+      nextPage,
+      replace,
+      refreshing = false,
+      searchParam = submittedItemSearch,
+    }: FetchItemPageOptions) => {
+      if (replace && !refreshing) {
+        setIsItemInitialLoading(true);
+      } else if (refreshing) {
+        setIsItemRefreshing(true);
+      } else {
+        setIsItemLoadingMore(true);
+      }
+
+      setItemErrorMessage('');
+      const requestId = latestItemRequestId.current + 1;
+      latestItemRequestId.current = requestId;
+
+      try {
+        const response = (await getAllLargeItemList({
+          OwnerId: ownerId,
+          SearchParam: searchParam,
+          pageIndex: nextPage,
+        })) as ItemInventoryListResponse;
+
+        if (requestId !== latestItemRequestId.current) {
+          return;
+        }
+
+        if (!isItemSuccessOrNoData(response)) {
+          throw new Error(getItemMessage(response) || 'Unable to load item list.');
+        }
+
+        const nextItems = getItemResultData(response);
+        setItems(previous => (replace ? nextItems : [...previous, ...nextItems]));
+        setItemPageIndex(nextPage);
+        setIsItemLastPage(nextItems.length === 0);
+      } catch (error) {
+        if (requestId !== latestItemRequestId.current) {
+          return;
+        }
+
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Unable to load item list right now.';
+        setItemErrorMessage(message);
+        if (replace) {
+          setItems([]);
+          setIsItemLastPage(true);
+        }
+      } finally {
+        if (requestId === latestItemRequestId.current) {
+          setIsItemInitialLoading(false);
+          setIsItemRefreshing(false);
+          setIsItemLoadingMore(false);
+        }
+      }
+    },
+    [ownerId, submittedItemSearch],
+  );
+
+  const loadFirstItemPage = useCallback(
+    (refreshing = false, searchParam = submittedItemSearch) => {
+      fetchItemPage({
+        nextPage: PAGE_START,
+        replace: true,
+        refreshing,
+        searchParam,
+      });
+    },
+    [fetchItemPage, submittedItemSearch],
+  );
+
+  useEffect(() => {
+    if (activeTab === 'primary' && !isFieldWorker) {
+      loadFirstItemPage();
+    }
+  }, [activeTab, isFieldWorker, loadFirstItemPage]);
+
+  const submitItemSearch = () => {
+    setSubmittedItemSearch(itemSearchText.trim());
+  };
+
+  const clearItemSearch = () => {
+    setItemSearchText('');
+    if (submittedItemSearch) {
+      setSubmittedItemSearch('');
+    }
+  };
+
+  const handleItemActionPress = (label: string, item: ItemInventoryListItem) => {
+    if (label === 'Update item') {
+      setEditingItem(item);
+      return;
+    }
+    if (label === 'Item options') {
+      setAssigningItem(item);
+      return;
+    }
+    // Delete: Java refuses when the item is still assigned to someone, and
+    // otherwise asks for confirmation (SureTodeleteItemDialog) first.
+    const assigned = getItemNumber(item, ['assignedQuantity', 'AssignedQuantity']);
+    if (assigned > 0) {
+      // Java dialog_delete_item: Cancel / PROCEED; PROCEED reloads the inventory (no delete).
+      askDelete(t('rn_this_item_is_assigned_to_fieldworkers_retu'), () => loadFirstItemPage(true), {
+        confirmLabel: tr('Proceed').toUpperCase(),
+        cancelLabel: tr('Cancel'),
+      });
+      return;
+    }
+    askDelete(tr('Are you sure do you want to delete the item ?'), async () => {
+          try {
+            ensureSuccess(await getDeleteItemPortal({Id: getItemId(item)}));
+            loadFirstItemPage(true);
+          } catch (error) {
+            showFailureMsg(error instanceof Error ? error.message : tr('Unable to delete item.'));
+          }
+    });
+  };
+
+  const openReturnDialog = (row: AssignedItemListItem) => {
+    setReturningRow(row);
+    setReturnQuantity('0');
+    setReturnNotes('');
+  };
+
+  const submitReturn = async () => {
+    if (!returningRow || !selectedItem) {
+      return;
+    }
+    const quantity = Math.trunc(Number(returnQuantity));
+    if (!quantity || quantity <= 0) {
+      showFailureMsg(t('please_enter_valid_quantity'));
+      return;
+    }
+    if (quantity > getAssignedQuantity(returningRow)) {
+      showFailureMsg(t('rn_quantity_cannot_exceed_the_issued_quantity'));
+      return;
+    }
+    if (!returnNotes.trim()) {
+      showFailureMsg(t('please_enter_notes'));
+      return;
+    }
+    const workerId = getAssignedNumber(returningRow, ['userId', 'UserId']);
+    setIsReturning(true);
+    try {
+      // Java (ItemInventoryAdapter -> ItemDialog.updateReturnItem): the row's
+      // user id is used for both UserId and CreatedBy.
+      ensureSuccess(
+        await returnItem({
+          UserId: workerId,
+          ItemId: getItemId(selectedItem),
+          Quantity: quantity,
+          ItemIssuedId: getAssignedNumber(returningRow, ['id', 'Id']),
+          TaskId: getAssignedNumber(returningRow, ['taskId', 'TaskId']),
+          CreatedBy: workerId,
+          Notes: returnNotes.trim(),
+        }),
+      );
+      setReturningRow(null);
+      handleIssuedDetailsPress();
+      loadFirstItemPage(true);
+    } catch (error) {
+      showFailureMsg(error instanceof Error ? error.message : tr('Unable to return item.'));
+    } finally {
+      setIsReturning(false);
+    }
+  };
+
+  const handleItemPress = (item: ItemInventoryListItem) => {
+    latestItemDetailRequestId.current += 1;
+    setSelectedItem(item);
+    setInventoryView('detail');
+    setItemDetailErrorMessage('');
+    setIsItemDetailLoading(false);
+  };
+
+  const handleIssuedDetailsPress = async () => {
+    if (!selectedItem) {
+      return;
+    }
+
+    const itemId = getItemId(selectedItem);
+    setInventoryView('issued');
+    setAssignedItems([]);
+    setAssignedSearchText('');
+    setAssignedErrorMessage('');
+
+    if (!itemId) {
+      setAssignedErrorMessage('Unable to load issued details without item id.');
+      return;
+    }
+
+    setIsAssignedLoading(true);
+    const requestId = latestAssignedRequestId.current + 1;
+    latestAssignedRequestId.current = requestId;
+
+    try {
+      const response = (await getAllAssignItemlistTechwise({
+        itemId,
+        OwnerId: ownerId,
+      })) as AssignedItemListResponse;
+
+      if (requestId !== latestAssignedRequestId.current) {
+        return;
+      }
+
+      if (!isAssignedSuccessOrNoData(response)) {
+        throw new Error(
+          getAssignedMessage(response) || 'Unable to load issued details.',
+        );
+      }
+
+      setAssignedItems(getAssignedResultData(response));
+    } catch (error) {
+      if (requestId !== latestAssignedRequestId.current) {
+        return;
+      }
+
+      setAssignedErrorMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to load issued details right now.',
+      );
+    } finally {
+      if (requestId === latestAssignedRequestId.current) {
+        setIsAssignedLoading(false);
+      }
+    }
+  };
+
+  const [usedItemToUpdate, setUsedItemToUpdate] = useState<GetUsedItemListResultData | null>(null);
+
+  const handleUsedDetailsPress = async () => {
+    if (!selectedItem) {
+      return;
+    }
+
+    const itemId = getItemId(selectedItem);
+    setInventoryView('used');
+    setUsedItems([]);
+    setUsedSearchText('');
+    setUsedErrorMessage('');
+
+    if (!itemId) {
+      setUsedErrorMessage('Unable to load used details without item id.');
+      return;
+    }
+
+    setIsUsedLoading(true);
+    const requestId = latestUsedRequestId.current + 1;
+    latestUsedRequestId.current = requestId;
+
+    try {
+      const response = (await getUsedItemlist({
+        itemId,
+        OwnerId: ownerId,
+      })) as UsedItemListResponse;
+
+      if (requestId !== latestUsedRequestId.current) {
+        return;
+      }
+
+      if (!isUsedSuccessOrNoData(response)) {
+        throw new Error(getUsedMessage(response) || 'Unable to load used details.');
+      }
+
+      setUsedItems(getUsedResultData(response));
+    } catch (error) {
+      if (requestId !== latestUsedRequestId.current) {
+        return;
+      }
+
+      setUsedErrorMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to load used details right now.',
+      );
+    } finally {
+      if (requestId === latestUsedRequestId.current) {
+        setIsUsedLoading(false);
+      }
+    }
+  };
+
+  const renderItemInventoryRow = ({item}: {item: ItemInventoryListItem}) => {
+    const itemId = getItemId(item);
+    const imageUri = getSafeImageUri(item);
+    const itemName = getItemName(item);
+
+    return (
+      <TouchableOpacity
+        activeOpacity={0.78}
+        style={styles.itemCard}
+        onPress={() => handleItemPress(item)}>
+        <View style={styles.unitBadge}>
+          <Text numberOfLines={1} style={styles.unitText}>
+            {getItemUnit(item)}
+          </Text>
+        </View>
+
+        <View style={styles.itemImageWrap}>
+          {imageUri ? (
+            <Image source={{uri: imageUri}} style={styles.itemImage} />
+          ) : (
+            <JavaDefaultItemIcon size={ms(48)} />
+          )}
+        </View>
+
+        <View style={styles.itemBody}>
+          <View style={styles.itemTitleRow}>
+            <Text numberOfLines={1} style={styles.itemName}>
+              {itemName.slice(0, 20)}
+            </Text>
+            <Text numberOfLines={1} style={styles.itemIdText}>
+              [{itemId || '-'}]
+            </Text>
+          </View>
+
+          <Text numberOfLines={1} style={styles.itemDescription}>
+            {String(getItemDescription(item) ?? '').slice(0, 21)}
+          </Text>
+        </View>
+
+        <View style={styles.quantityRow}>
+            <Text style={[styles.quantityLabel, {marginLeft: 0}]}>{t('rn_available')}</Text>
+            <Text style={styles.quantityValue}>{getAvailableQuantity(item)}</Text>
+            <Text style={styles.quantityLabel}>{t('rn_issued')}</Text>
+            <Text style={styles.quantityValue}>{getIssuedQuantity(item)}</Text>
+            <Text style={styles.quantityLabel}>{t('rn_used')}</Text>
+            <Text style={styles.quantityValue}>{getUsedQuantity(item)}</Text>
+        </View>
+
+        <View style={styles.actionColumn}>
+          <Pressable
+            hitSlop={10}
+            style={styles.actionButton}
+            onPress={() => handleItemActionPress('Update item', item)}>
+            <EditSquareIcon size={ms(20)} color={COLORS.textBlack} />
+          </Pressable>
+          <Pressable
+            hitSlop={10}
+            style={styles.actionButton}
+            onPress={() => handleItemActionPress('Item options', item)}>
+            <JavaItemOptionIcon size={ms(20)} color={COLORS.textBlack} />
+          </Pressable>
+          <Pressable
+            hitSlop={10}
+            style={styles.actionButton}
+            onPress={() => handleItemActionPress('Delete item', item)}>
+            <DeleteAccIcon size={ms(20)} color={COLORS.statusRejected} />
+          </Pressable>
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
+  const renderItemListTab = () => (
+    <View style={styles.card}>
+      <View style={styles.searchRow}>
+        <View style={styles.searchBox}>
+          <Ionicons name="search" style={styles.searchIcon} />
+          <TextInput
+            value={itemSearchText}
+            onChangeText={value => {
+              const nextValue = value.slice(0, ITEM_SEARCH_LIMIT);
+              setItemSearchText(nextValue);
+              if (!nextValue.trim() && submittedItemSearch) {
+                setSubmittedItemSearch('');
+              }
+            }}
+            onSubmitEditing={submitItemSearch}
+            placeholder={t('search_item')}
+            placeholderTextColor={COLORS.lightGray}
+            style={styles.searchInput}
+            returnKeyType="search"
+          />
+          <Pressable hitSlop={10} onPress={clearItemSearch}>
+            <Ionicons name="close" style={styles.clearText} />
+          </Pressable>
+        </View>
+        <Pressable style={styles.addItemButton} onPress={() => setIsAddingItem(true)}>
+          <Text style={styles.addItemButtonText}>+ {t('item')}</Text>
+        </Pressable>
+      </View>
+
+      {isItemInitialLoading ? (
+        <View style={styles.loadingOverlay}>
+          <ActivityIndicator color={THEME_PRIMARY} />
+          <Text style={styles.loadingText}>{t('rn_loading_items')}</Text>
+        </View>
+      ) : null}
+
+      <FlatList
+        data={items}
+        keyExtractor={(item, index) => `${getItemId(item) || index}-${index}`}
+        renderItem={renderItemInventoryRow}
+        contentContainerStyle={styles.listContent}
+        refreshControl={
+          <RefreshControl
+            refreshing={isItemRefreshing}
+            colors={[THEME_PRIMARY]}
+            tintColor={THEME_PRIMARY}
+            onRefresh={() => loadFirstItemPage(true)}
+          />
+        }
+        ListEmptyComponent={
+          isItemInitialLoading ? null : itemErrorMessage ? (
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyTitle}>{t('rn_unable_to_load_items')}</Text>
+              <Text style={styles.emptyText}>{itemErrorMessage}</Text>
+            </View>
+          ) : (
+            <View style={styles.emptyState}>
+              <Image
+                source={require('../../../assets/images/noresultfound.png')}
+                style={styles.emptyImage}
+                resizeMode="contain"
+              />
+            </View>
+          )
+        }
+        ListFooterComponent={
+          isItemLoadingMore ? (
+            <View style={styles.listFooter}>
+              <ActivityIndicator color={THEME_PRIMARY} size="small" />
+            </View>
+          ) : null
+        }
+        onEndReachedThreshold={0.35}
+        onEndReached={() => {
+          if (!isItemInitialLoading && !isItemLoadingMore && !isItemLastPage) {
+            fetchItemPage({nextPage: itemPageIndex + 1, replace: false});
+          }
+        }}
+      />
+    </View>
+  );
+
+  // Java rows: 20dp tall, 200dp label + 150dp value; marginTop varies per row (mt).
+  const renderDetailRow = (
+    label: string,
+    value: string | number,
+    valueStyle?: object,
+    mt = 0,
+  ) => (
+    <View style={[styles.detailRow, {marginTop: ms(mt)}]}>
+      <Text style={styles.detailLabel}>{label}</Text>
+      <Text style={[styles.detailValue, valueStyle]}>{value}</Text>
+    </View>
+  );
+
+  const renderItemDetail = () => {
+    if (!selectedItem) {
+      return null;
+    }
+
+    const selectedItemName = getItemName(selectedItem);
+    const selectedItemId = getItemId(selectedItem);
+    const imageUri = getSafeImageUri(selectedItem);
+    const purchasePrice = getPurchasePrice(selectedItem);
+    const salesPrice = getSalesPrice(selectedItem);
+    const availableQuantity = getAvailableQuantity(selectedItem);
+    const issuedQuantity = getIssuedQuantity(selectedItem);
+    const usedQuantity = getUsedQuantity(selectedItem);
+
+    return (
+      <View style={styles.detailRoot}>
+        <View style={styles.detailCard}>
+          <ScrollView
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={styles.detailScroll}>
+            <View style={styles.detailImageWrap}>
+              {imageUri ? (
+                <Image source={{uri: imageUri}} style={styles.detailImage} />
+              ) : (
+                <View style={styles.noImageBox}>
+                  <NoImageCameraIcon size={ms(130)} />
+                  <Text style={styles.noImageText}>{t('rn_no_image_available')}</Text>
+                </View>
+              )}
+            </View>
+
+            <View style={styles.detailActionRow}>
+              <Pressable
+                style={[styles.detailPill, styles.detailPillDark]}
+                onPress={handleIssuedDetailsPress}>
+                <IssueItemDialogIcon size={ms(30)} color="#FFFFFF" />
+                <Text style={styles.detailPillText}>{t('rn_issued_details')}</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.detailPill, styles.detailPillPrimary]}
+                onPress={handleUsedDetailsPress}>
+                <JavaItemOptionIcon size={ms(30)} color="#FFFFFF" />
+                <Text style={styles.detailPillText}>{t('rn_used_details')}</Text>
+              </Pressable>
+            </View>
+
+            {itemDetailErrorMessage ? (
+              <Text style={styles.detailErrorText}>{itemDetailErrorMessage}</Text>
+            ) : null}
+
+            <View style={styles.detailTitleRow}>
+              <Text numberOfLines={1} style={styles.detailTitle}>
+                {selectedItemName}
+              </Text>
+              <Text style={styles.detailId}>[{selectedItemId || '-'}]</Text>
+            </View>
+
+            <Text style={[styles.detailSectionTitle, {marginTop: ms(20)}]}>{t('item_details')}</Text>
+            {renderDetailRow('Create Date', formatItemDate(selectedItem), undefined, 15)}
+            {renderDetailRow('Item Code', getItemCodeValue(selectedItem))}
+            {renderDetailRow('HSN Code', getItemHsnCode(selectedItem))}
+            {renderDetailRow('Group Name', getItemGroupName(selectedItem))}
+            {renderDetailRow('Serial No.', getItemString(selectedItem, 'serialNoValue', 'SerialNoValue'), undefined, 5)}
+            {renderDetailRow('Purchase Price', formatCurrency(purchasePrice), styles.priceGreen, 5)}
+            {renderDetailRow('Sales Price', formatCurrency(salesPrice), styles.priceGreen, 5)}
+            {renderDetailRow('Unit', getItemUnit(selectedItem), undefined, 5)}
+            {renderDetailRow('Description', getItemDescription(selectedItem), undefined, 5)}
+
+            <Text style={[styles.detailSectionTitle, {marginTop: ms(15)}]}>{t('rn_qty_details')}</Text>
+            {renderDetailRow('Available', availableQuantity, undefined, 15)}
+            {renderDetailRow('Issued', issuedQuantity, undefined, 5)}
+            {renderDetailRow('Used', usedQuantity, undefined, 5)}
+            {renderDetailRow('Available Qty. Price', formatCurrency(availableQuantity * purchasePrice), styles.priceBlue, 15)}
+            {renderDetailRow('Issued Qty. Price', formatCurrency(issuedQuantity * purchasePrice), styles.priceOrange, 5)}
+            {renderDetailRow('Used Qty. Price', formatCurrency(usedQuantity * purchasePrice), styles.pricePrimary, 5)}
+          </ScrollView>
+        </View>
+      </View>
+    );
+  };
+
+  // Java advance_item_inventory_tech_list: 80dp card, 4 weighted text columns + 20dp return icon.
+  const renderAssignedItemRow = ({item}: {item: AssignedItemListItem}) => (
+    <View style={styles.assignedCard}>
+      <View style={styles.assignedCardTopRow}>
+        <Text style={[styles.assignedLabel, styles.assignedCol, {paddingLeft: ms(15)}]}>{t('task_id_title')}</Text>
+        <Text numberOfLines={1} style={[styles.assignedValue, styles.assignedCol]}>
+          {getAssignedTaskId(item)}
+        </Text>
+        <Text style={[styles.assignedLabel, styles.assignedCol]}>{t('issued_qty') + ' :'}</Text>
+        <Text numberOfLines={1} style={[styles.assignedValue, styles.assignedCol]}>
+          {getAssignedQuantity(item)}
+        </Text>
+        <Pressable hitSlop={10} onPress={() => openReturnDialog(item)}>
+          <ReturnIcon size={ms(20)} />
+        </Pressable>
+        <View style={styles.assignedCol} />
+      </View>
+      <Text numberOfLines={1} style={styles.assignedWorkerName}>
+        {getAssignedFieldWorkerName(item)}
+      </Text>
+    </View>
+  );
+
+  // Java advance_useditem_inventory_task_list.
+  const renderUsedItemRow = ({item}: {item: UsedItemListItem}) => {
+    const u = item as Record<string, any>;
+    const num = (...keys: string[]) => Number(keys.map(k => u[k]).find(v => v !== undefined && v !== null)) || 0;
+    return (
+    <View style={styles.usedCard}>
+      <View style={styles.usedTagLeft}>
+        <Text style={styles.usedTagText}>{getUsedTaskId(item)}</Text>
+      </View>
+      <View style={styles.usedTagRight}>
+        <Text numberOfLines={1} style={[styles.usedTagText, {maxWidth: ms(230)}]}>
+          {String(u.TaskName ?? u.taskName ?? '')}
+        </Text>
+      </View>
+      <View style={styles.usedQtyRow}>
+        <Text style={styles.usedQtyLabel}>{t('rn_assigned_qty')}</Text>
+        <Text style={styles.usedQtyLabel}>{t('issued_qty')}</Text>
+        <Text style={styles.usedQtyLabel}>{t('used_qty')}</Text>
+      </View>
+      <View style={[styles.usedQtyRow, {marginTop: ms(5)}]}>
+        <Text style={[styles.usedQtyValue, {color: '#2F61D5'}]}>
+          {num('AssignedQty', 'assignedQty')}
+        </Text>
+        <Text style={[styles.usedQtyValue, {color: '#ff9b00'}]}>
+          {num('ItemIssuedQuantity', 'itemIssuedQuantity')}
+        </Text>
+        <Text style={[styles.usedQtyValue, {color: COLORS.primary}]}>
+          {getUsedDetailQuantity(item)}
+        </Text>
+      </View>
+      <View style={styles.usedFooterRow}>
+        <Text numberOfLines={1} style={styles.usedTechName}>
+          {getUsedFieldWorkerName(item)}
+        </Text>
+        <Pressable
+          style={styles.usedViewTask}
+          onPress={() =>
+            (navigation as any).navigate('TaskDetails', {
+              taskId: num('TaskId', 'taskId'),
+              sheet: true,
+              headerTitle: t('item_inventory'),
+              fallbackTask: {Id: num('TaskId', 'taskId'), NewTaskId: String(u.NewTaskID ?? u.newTaskID ?? u.NewTaskId ?? '') || undefined},
+              // Java opens CRMTaskDetailsFragmentNew (downloadReport + allowToReassign) from here.
+              source: 'crm',
+            })
+          }>
+          <Text style={styles.usedViewTaskText}>{t('rn_view_task')} {'>>'}</Text>
+        </Pressable>
+      </View>
+      <Pressable
+        hitSlop={10}
+        style={styles.usedReturn}
+        onPress={() => setUsedItemToUpdate(item as GetUsedItemListResultData)}>
+        <ReturnIcon size={ms(20)} />
+      </Pressable>
+    </View>
+    );
+  };
+
+  const renderIssuedDetails = () => {
+    if (!selectedItem) {
+      return null;
+    }
+
+    const purchasePrice = getPurchasePrice(selectedItem);
+    const normalizedSearch = assignedSearchText.trim().toLowerCase();
+    const filteredAssignedItems = normalizedSearch
+      ? assignedItems.filter(item =>
+          getAssignedFieldWorkerName(item).toLowerCase().includes(normalizedSearch),
+        )
+      : assignedItems;
+    const totalIssuedQuantity = assignedItems.reduce(
+      (sum, item) => sum + getAssignedQuantity(item),
+      0,
+    );
+    const totalIssuedPrice =
+      purchasePrice > 0 ? (totalIssuedQuantity * purchasePrice).toFixed(3) : '-NA-';
+
+    return (
+      <View style={styles.issuedCard}>
+        <View style={styles.issuedHeaderRow}>
+          <Text numberOfLines={1} style={styles.issuedItemName}>
+            {getItemName(selectedItem)}
+          </Text>
+          <Text style={styles.issuedTotalLabel}>{t('rn_total_issued_qty')}</Text>
+          <Text style={styles.issuedTotalValue}>{totalIssuedQuantity}</Text>
+        </View>
+
+        <Text style={styles.issuedPriceText}>
+          {t('rn_total_issued_item_price')} {totalIssuedPrice}
+        </Text>
+
+        <View style={styles.issuedSearchRow}>
+          <Ionicons name="search" style={styles.searchIcon} />
+          <TextInput
+            value={assignedSearchText}
+            onChangeText={setAssignedSearchText}
+            placeholder={t('rn_search_by_fieldworker_name')}
+            placeholderTextColor={COLORS.lightGray}
+            style={styles.searchInput}
+          />
+          <Pressable hitSlop={10} onPress={() => setAssignedSearchText('')}>
+            <Ionicons name="close" style={styles.clearText} />
+          </Pressable>
+        </View>
+
+        {isAssignedLoading ? (
+          <View style={styles.issuedStatusBlock}>
+            <ActivityIndicator color={THEME_PRIMARY} />
+            <Text style={styles.issuedStatusText}>{t('rn_loading_issued_details')}</Text>
+          </View>
+        ) : null}
+
+        {assignedErrorMessage ? (
+          <Text style={styles.issuedErrorText}>{assignedErrorMessage}</Text>
+        ) : null}
+
+        <FlatList
+          data={filteredAssignedItems}
+          keyExtractor={(item, index) =>
+            `${getAssignedTaskId(item)}-${getAssignedQuantity(item)}-${index}`
+          }
+          renderItem={renderAssignedItemRow}
+          contentContainerStyle={styles.assignedListContent}
+          ListEmptyComponent={
+            isAssignedLoading ? null : assignedErrorMessage ? (
+              <View style={styles.emptyState}>
+                <Text style={styles.emptyTitle}>{t('rn_unable_to_load_issued_items')}</Text>
+                <Text style={styles.emptyText}>{assignedErrorMessage}</Text>
+              </View>
+            ) : (
+              <View style={styles.emptyState}>
+                <Image
+                  source={require('../../../assets/images/noresultfound.png')}
+                  style={styles.emptyImage}
+                  resizeMode="contain"
+                />
+              </View>
+            )
+          }
+        />
+      </View>
+    );
+  };
+
+  const renderUsedDetails = () => {
+    if (!selectedItem) {
+      return null;
+    }
+
+    const purchasePrice = getPurchasePrice(selectedItem);
+    const normalizedSearch = usedSearchText.trim().toLowerCase();
+    const filteredUsedItems = normalizedSearch
+      ? usedItems.filter(item =>
+          getUsedFieldWorkerName(item).toLowerCase().includes(normalizedSearch),
+        )
+      : usedItems;
+    const totalUsedQuantity = usedItems.reduce(
+      (sum, item) => sum + getUsedDetailQuantity(item),
+      0,
+    );
+    const responseItemName = usedItems.map(getUsedItemName).find(Boolean);
+    const totalUsedPrice =
+      purchasePrice > 0 ? (totalUsedQuantity * purchasePrice).toFixed(3) : '-NA-';
+
+    return (
+      <View style={styles.issuedCard}>
+        <View style={styles.issuedHeaderRow}>
+          <Text numberOfLines={1} style={styles.issuedItemName}>
+            {responseItemName || getItemName(selectedItem)}
+          </Text>
+          <Text style={styles.issuedTotalLabel}>{t('rn_total_used_qty')}</Text>
+          <Text style={styles.issuedTotalValue}>{totalUsedQuantity}</Text>
+        </View>
+
+        <Text style={styles.issuedPriceText}>
+          {t('rn_total_used_item_price')} {totalUsedPrice}
+        </Text>
+
+        <View style={styles.issuedSearchRow}>
+          <Ionicons name="search" style={styles.searchIcon} />
+          <TextInput
+            value={usedSearchText}
+            onChangeText={setUsedSearchText}
+            placeholder={t('rn_search_by_fieldworker_name')}
+            placeholderTextColor={COLORS.lightGray}
+            style={styles.searchInput}
+          />
+          <Pressable hitSlop={10} onPress={() => setUsedSearchText('')}>
+            <Ionicons name="close" style={styles.clearText} />
+          </Pressable>
+        </View>
+
+        {isUsedLoading ? (
+          <View style={styles.issuedStatusBlock}>
+            <ActivityIndicator color={THEME_PRIMARY} />
+            <Text style={styles.issuedStatusText}>{t('rn_loading_used_details')}</Text>
+          </View>
+        ) : null}
+
+        {usedErrorMessage ? (
+          <Text style={styles.issuedErrorText}>{usedErrorMessage}</Text>
+        ) : null}
+
+        <FlatList
+          data={filteredUsedItems}
+          keyExtractor={(item, index) =>
+            `${getUsedTaskId(item)}-${getUsedDetailQuantity(item)}-${index}`
+          }
+          renderItem={renderUsedItemRow}
+          contentContainerStyle={styles.assignedListContent}
+          ListEmptyComponent={
+            isUsedLoading ? null : usedErrorMessage ? (
+              <View style={styles.emptyState}>
+                <Text style={styles.emptyTitle}>{t('rn_unable_to_load_used_items')}</Text>
+                <Text style={styles.emptyText}>{usedErrorMessage}</Text>
+              </View>
+            ) : (
+              <View style={styles.emptyState}>
+                <Image
+                  source={require('../../../assets/images/noresultfound.png')}
+                  style={styles.emptyImage}
+                  resizeMode="contain"
+                />
+              </View>
+            )
+          }
+        />
+      </View>
+    );
+  };
+
+  const renderPlaceholderTab = () => (
+    <View style={styles.card}>
+      <View style={styles.emptyState}>
+        <Text style={styles.emptyTitle}>{t('rn_no_issued_items')}</Text>
+        <Text style={styles.emptyText}>
+          TechItemsInventoryFragmentNew is not migrated yet.
+        </Text>
+      </View>
+    </View>
+  );
+
+  return (
+    <>
+      {deleteDialog}
+    <View
+      style={[
+        styles.shell,
+        selectedItem && (inventoryView === 'issued' || inventoryView === 'used')
+          ? styles.shellRed
+          : null,
+      ]}>
+      {focDetail ? (
+        <FOCDetailsScreen admin focRequest={focDetail} onClose={() => setFocDetail(null)} />
+      ) : selectedItem && inventoryView === 'issued' ? (
+        renderIssuedDetails()
+      ) : selectedItem && inventoryView === 'used' ? (
+        renderUsedDetails()
+      ) : selectedItem && inventoryView === 'detail' ? (
+        renderItemDetail()
+      ) : (
+        <>
+          <TabStrip
+            tabs={tabs.map(tab => ({key: tab.key, label: tab.label.toUpperCase()}))}
+            active={activeTab}
+            onChange={setActiveTab}
+          />
+
+          {activeTab === 'requested'
+            ? <FOCScreen
+                ownerId={ownerId}
+                isFieldWorker={isFieldWorker}
+                onOpenDetails={item => setFocDetail(item as unknown as Record<string, unknown>)}
+              />
+            : isFieldWorker
+              ? renderPlaceholderTab()
+              : renderItemListTab()}
+        </>
+      )}
+      <AddItemModal
+        visible={isAddingItem}
+        ownerId={ownerId}
+        item={null}
+        onClose={() => setIsAddingItem(false)}
+        onSaved={() => loadFirstItemPage(true)}
+      />
+
+      <AddItemModal
+        visible={editingItem !== null}
+        ownerId={ownerId}
+        item={editingItem as Record<string, unknown> | null}
+        onClose={() => setEditingItem(null)}
+        onSaved={() => loadFirstItemPage(true)}
+      />
+
+      <AssignItemModal
+        visible={assigningItem !== null}
+        ownerId={ownerId}
+        initialItem={
+          assigningItem
+            ? {id: getItemId(assigningItem), name: getItemName(assigningItem)}
+            : null
+        }
+        onClose={() => setAssigningItem(null)}
+        onAssigned={() => loadFirstItemPage(true)}
+      />
+
+      <Modal
+        visible={returningRow !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setReturningRow(null)}>
+        <View style={{flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'center', padding: ms(24)}}>
+          <View style={{backgroundColor: '#FFFFFF', borderRadius: ms(12), padding: ms(16)}}>
+            <Text style={{fontSize: sp(16), fontWeight: '700', marginBottom: ms(10)}}>{t('rn_return_item')}</Text>
+            <Text style={{marginBottom: ms(4)}}>{selectedItem ? getItemName(selectedItem) : ''}</Text>
+            <Text style={{color: '#6B7280', marginBottom: ms(10)}}>
+              {returningRow ? getAssignedFieldWorkerName(returningRow) : ''} {t('rn_issued_2')}{' '}
+              {returningRow ? getAssignedQuantity(returningRow) : 0}
+            </Text>
+            <View style={{flexDirection: 'row', alignItems: 'center', marginBottom: ms(10)}}>
+              <Pressable
+                onPress={() => setReturnQuantity(String(Math.max(0, (Number(returnQuantity) || 0) - 1)))}
+                style={{padding: ms(10)}}>
+                <Text style={{fontSize: sp(20)}}>−</Text>
+              </Pressable>
+              <DecimalInput integer
+                style={{flex: 1, borderWidth: 1, borderColor: '#d5d7db', borderRadius: ms(8), textAlign: 'center', padding: ms(6)}}
+                value={returnQuantity}
+                onChangeText={setReturnQuantity}
+              />
+              <Pressable
+                onPress={() => setReturnQuantity(String((Number(returnQuantity) || 0) + 1))}
+                style={{padding: ms(10)}}>
+                <Text style={{fontSize: sp(20)}}>+</Text>
+              </Pressable>
+            </View>
+            <TextInput
+              style={{borderWidth: 1, borderColor: '#d5d7db', borderRadius: ms(8), padding: ms(8), minHeight: ms(70), textAlignVertical: 'top', marginBottom: ms(12)}}
+              placeholder={t('note')}
+              placeholderTextColor="#9aa0a6"
+              multiline
+              value={returnNotes}
+              onChangeText={setReturnNotes}
+            />
+            <Pressable
+              onPress={submitReturn}
+              disabled={isReturning}
+              style={{backgroundColor: THEME_PRIMARY, borderRadius: ms(24), paddingVertical: ms(12), alignItems: 'center', marginBottom: ms(8)}}>
+              <Text style={{color: '#FFFFFF', fontWeight: '700'}}>{isReturning ? tr('RETURNING...') : tr('RETURN')}</Text>
+            </Pressable>
+            <Pressable onPress={() => setReturningRow(null)} style={{alignItems: 'center', padding: ms(6)}}>
+              <Text style={{color: '#6B7280'}}>{t('cancel')}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      <UsedItemUpdateModal
+        row={usedItemToUpdate}
+        onClose={() => setUsedItemToUpdate(null)}
+        onUpdated={() => {
+          // Java reloads ItemInventoryTabHost after the update; reload the used list.
+          setUsedItemToUpdate(null);
+          handleUsedDetailsPress();
+        }}
+      />
+    </View>
+    </>
+  );
+};
+
+const styles = StyleSheet.create({
+  usedRowFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  usedRowRefresh: {
+    fontSize: sp(18),
+    color: THEME_PRIMARY,
+  },
+  shell: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+  },
+  tabBar: {
+    height: ms(50),
+    backgroundColor: '#FFFFFF',
+    flexDirection: 'row',
+    borderBottomWidth: ms(1),
+    borderBottomColor: '#ECECEC',
+  },
+  tabButton: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderBottomWidth: ms(4),
+    borderBottomColor: 'transparent',
+    paddingHorizontal: ms(8),
+  },
+  tabButtonActive: {
+    borderBottomColor: THEME_PRIMARY,
+    backgroundColor: 'rgba(195,0,47,0.06)',
+  },
+  tabText: {
+    color: '#555555',
+    fontSize: sp(14),
+    fontWeight: '700',
+  },
+  tabTextActive: {
+    color: THEME_PRIMARY,
+  },
+  // Java owner_item_inventory_fragment_new: plain white card (no rounded top) under the tab strip.
+  card: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+  },
+  // Java item_inventory_details_enhanced: red root (paddingTop 10) + white 30dp-radius sheet.
+  detailRoot: {
+    flex: 1,
+    backgroundColor: COLORS.primary,
+    paddingTop: ms(10),
+  },
+  detailCard: {
+    flex: 1,
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+    backgroundColor: '#FFFFFF',
+    overflow: 'hidden',
+  },
+  detailScroll: {
+    paddingTop: ms(20),
+    paddingBottom: ms(110),
+  },
+  detailImageWrap: {
+    alignItems: 'center',
+  },
+  detailImage: {
+    width: ms(150),
+    height: ms(150),
+    borderRadius: ms(15),
+    borderWidth: ms(1),
+    borderColor: COLORS.lightGray,
+    resizeMode: 'contain',
+    backgroundColor: '#FFFFFF',
+  },
+  noImageBox: {
+    width: ms(150),
+    height: ms(150),
+    borderRadius: ms(15),
+    borderWidth: ms(1),
+    borderColor: COLORS.lightGray,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
+  },
+  noImageText: {
+    position: 'absolute',
+    top: ms(10 + 130 * 0.69),
+    color: '#B7B7B7',
+    fontSize: sp(9),
+  },
+  detailActionRow: {
+    marginTop: ms(10),
+    flexDirection: 'row',
+  },
+  detailPill: {
+    flex: 1,
+    minHeight: ms(48),
+    margin: ms(10),
+    borderRadius: ms(34),
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingLeft: ms(15),
+    paddingRight: ms(15),
+    elevation: 3,
+    shadowColor: '#000000',
+    shadowOpacity: 0.15,
+    shadowRadius: 5,
+    shadowOffset: {width: 0, height: 2},
+  },
+  detailPillDark: {
+    backgroundColor: '#353935',
+  },
+  detailPillPrimary: {
+    backgroundColor: COLORS.primary,
+  },
+  detailPillText: {
+    flex: 1,
+    textAlign: 'center',
+    color: '#FFFFFF',
+    fontSize: sp(14),
+  },
+  detailErrorText: {
+    marginTop: ms(14),
+    marginHorizontal: ms(30),
+    color: '#B42318',
+    fontSize: sp(13),
+    fontWeight: '700',
+  },
+  detailTitleRow: {
+    marginTop: ms(10),
+    marginHorizontal: ms(30),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  detailTitle: {
+    flex: 1,
+    color: COLORS.black,
+    fontSize: sp(24),
+    fontWeight: 'bold',
+  },
+  detailId: {
+    flex: 1,
+    marginLeft: ms(10),
+    textAlign: 'center',
+    color: COLORS.linkBlue,
+    fontSize: sp(20),
+    fontWeight: 'bold',
+  },
+  detailSectionTitle: {
+    marginHorizontal: ms(30),
+    color: COLORS.black,
+    fontSize: sp(16),
+    fontWeight: 'bold',
+  },
+  detailRow: {
+    height: ms(20),
+    marginHorizontal: ms(30),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  detailLabel: {
+    width: ms(200),
+    color: COLORS.black,
+    fontSize: sp(16),
+  },
+  detailValue: {
+    width: ms(150),
+    color: COLORS.black,
+    fontSize: sp(16),
+  },
+  priceGreen: {
+    color: '#03de73',
+  },
+  priceBlue: {
+    color: '#2F61D5',
+  },
+  priceOrange: {
+    color: '#FBC02D',
+  },
+  pricePrimary: {
+    color: COLORS.primary,
+  },
+  shellRed: {
+    backgroundColor: COLORS.primary,
+    paddingTop: ms(10),
+  },
+  // Java item_inventory_details / useditem_inventory_details: 30dp-radius white sheet.
+  issuedCard: {
+    flex: 1,
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+    backgroundColor: '#FFFFFF',
+    overflow: 'hidden',
+  },
+  issuedHeaderRow: {
+    height: ms(20),
+    marginTop: ms(30),
+    marginHorizontal: ms(30),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  issuedItemName: {
+    width: ms(150),
+    color: COLORS.black,
+    fontSize: sp(16),
+    fontWeight: 'bold',
+  },
+  issuedTotalLabel: {
+    color: COLORS.black,
+    fontSize: sp(16),
+    fontWeight: 'bold',
+  },
+  issuedTotalValue: {
+    marginLeft: ms(5),
+    color: COLORS.primary,
+    fontSize: sp(16),
+    fontWeight: 'bold',
+  },
+  issuedPriceText: {
+    marginTop: ms(20),
+    marginHorizontal: ms(30),
+    color: COLORS.slate,
+    fontSize: sp(14),
+    fontWeight: 'bold',
+  },
+  issuedSearchRow: {
+    height: ms(40),
+    marginTop: ms(11),
+    marginLeft: ms(23),
+    marginRight: ms(16),
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.darkGray,
+    paddingHorizontal: ms(12),
+  },
+  issuedStatusBlock: {
+    paddingVertical: ms(18),
+    alignItems: 'center',
+  },
+  issuedStatusText: {
+    marginTop: ms(8),
+    color: '#4B5563',
+    fontSize: sp(13),
+  },
+  issuedErrorText: {
+    margin: ms(14),
+    color: '#B42318',
+    fontSize: sp(13),
+    fontWeight: '700',
+  },
+  assignedListContent: {
+    flexGrow: 1,
+    marginTop: ms(13),
+    paddingHorizontal: ms(24),
+    paddingBottom: ms(110),
+  },
+  assignedCard: {
+    height: ms(80),
+    marginVertical: ms(5),
+    marginBottom: ms(15),
+    borderRadius: ms(10),
+    backgroundColor: '#FFFFFF',
+    elevation: 2,
+    shadowColor: '#000000',
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    shadowOffset: {width: 0, height: 1},
+  },
+  assignedCardTopRow: {
+    marginTop: ms(10),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  assignedCol: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 'auto',
+  },
+  assignedLabel: {
+    color: COLORS.black,
+    fontSize: sp(16),
+    fontWeight: 'bold',
+  },
+  assignedValue: {
+    color: COLORS.primary,
+    fontSize: sp(14),
+  },
+  assignedWorkerName: {
+    position: 'absolute',
+    top: ms(50),
+    left: ms(15),
+    color: COLORS.lightGray,
+    fontSize: sp(13),
+    fontWeight: 'bold',
+  },
+  usedCard: {
+    marginVertical: ms(8),
+    marginHorizontal: ms(-2),
+    borderRadius: ms(10),
+    backgroundColor: '#FFFFFF',
+    elevation: 2,
+    shadowColor: '#000000',
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    shadowOffset: {width: 0, height: 1},
+  },
+  usedTagLeft: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#353935',
+    borderTopLeftRadius: ms(10),
+    borderBottomRightRadius: ms(10),
+    paddingHorizontal: ms(15),
+    paddingVertical: ms(3),
+  },
+  usedTagRight: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    backgroundColor: COLORS.primary,
+    borderTopRightRadius: ms(10),
+    borderBottomLeftRadius: ms(10),
+    paddingHorizontal: ms(15),
+    paddingVertical: ms(3),
+  },
+  usedTagText: {
+    color: '#FFFFFF',
+    fontSize: sp(9),
+    textTransform: 'uppercase',
+  },
+  usedQtyRow: {
+    marginTop: ms(8),
+    marginHorizontal: ms(10),
+    flexDirection: 'row',
+  },
+  usedQtyLabel: {
+    flex: 1,
+    textAlign: 'center',
+    color: COLORS.ink,
+    fontSize: sp(16),
+  },
+  usedQtyValue: {
+    flex: 1,
+    textAlign: 'center',
+    fontSize: sp(14),
+  },
+  usedFooterRow: {
+    marginTop: ms(10),
+    marginBottom: ms(14),
+    marginHorizontal: ms(10),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  usedTechName: {
+    flex: 2,
+    paddingLeft: ms(5),
+    color: COLORS.lightGray,
+    fontSize: sp(12),
+    fontWeight: 'bold',
+  },
+  usedViewTask: {
+    flex: 1,
+    marginLeft: ms(-12),
+  },
+  usedViewTaskText: {
+    color: COLORS.primary,
+    fontSize: sp(12),
+    fontWeight: 'bold',
+  },
+  usedReturn: {
+    position: 'absolute',
+    right: ms(10),
+    bottom: ms(12),
+  },
+  searchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingLeft: ms(15),
+    paddingRight: ms(20),
+    paddingTop: ms(15),
+    paddingBottom: ms(5),
+    gap: ms(13),
+  },
+  searchBox: {
+    flex: 1,
+    marginLeft: ms(8),
+    height: ms(40),
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.darkGray,
+    paddingHorizontal: ms(12),
+  },
+  searchIcon: {
+    color: COLORS.lightGray,
+    fontSize: ms(20),
+    marginRight: ms(1),
+  },
+  searchInput: {
+    flex: 1,
+    paddingVertical: 0,
+    color: COLORS.textBlack,
+    fontSize: sp(15),
+  },
+  clearText: {
+    color: COLORS.textBlack,
+    fontSize: ms(20),
+  },
+  addItemButton: {
+    width: ms(60),
+    height: ms(30),
+    borderRadius: ms(15),
+    backgroundColor: COLORS.textBlack,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  addItemButtonText: {
+    color: '#FFFFFF',
+    fontSize: sp(12),
+  },
+  loadingOverlay: {
+    paddingVertical: ms(18),
+    alignItems: 'center',
+  },
+  loadingText: {
+    marginTop: ms(8),
+    color: '#4B5563',
+    fontSize: sp(13),
+  },
+  listContent: {
+    flexGrow: 1,
+    paddingHorizontal: ms(10),
+    paddingTop: 0,
+    paddingBottom: ms(112),
+  },
+  itemCard: {
+    height: ms(140),
+    marginHorizontal: ms(5),
+    marginTop: ms(5),
+    marginBottom: ms(20),
+    borderRadius: ms(10),
+    backgroundColor: '#FFFFFF',
+    borderWidth: ms(1),
+    borderColor: '#EFEFEF',
+    elevation: 1,
+    shadowColor: '#000000',
+    shadowOpacity: 0.08,
+    shadowRadius: 4,
+    shadowOffset: {width: 0, height: 1},
+    overflow: 'hidden',
+  },
+  unitBadge: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    minWidth: ms(55),
+    maxWidth: ms(86),
+    backgroundColor: COLORS.textBlack,
+    borderTopLeftRadius: ms(10),
+    borderBottomRightRadius: ms(10),
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: ms(10),
+    paddingVertical: ms(3),
+    zIndex: 2,
+  },
+  unitText: {
+    color: '#FFFFFF',
+    fontSize: sp(10),
+    fontWeight: '700',
+  },
+  itemImageWrap: {
+    position: 'absolute',
+    left: ms(10),
+    top: ms(30),
+    width: ms(60),
+    height: ms(60),
+    borderRadius: ms(30),
+    backgroundColor: 'transparent',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  itemImage: {
+    width: ms(60),
+    height: ms(60),
+  },
+  defaultItemIcon: {
+    width: ms(38),
+    height: ms(34),
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  defaultItemBoxTop: {
+    position: 'absolute',
+    top: ms(4),
+    width: ms(28),
+    height: ms(8),
+    borderRadius: ms(2),
+    opacity: 0.85,
+    transform: [{skewX: '-18deg'}],
+  },
+  defaultItemBoxFace: {
+    position: 'absolute',
+    bottom: ms(2),
+    width: ms(30),
+    height: ms(22),
+    borderWidth: ms(2),
+    borderRadius: ms(4),
+  },
+  defaultItemBoxSide: {
+    position: 'absolute',
+    right: ms(3),
+    bottom: ms(7),
+    width: ms(7),
+    height: ms(18),
+    borderRadius: ms(2),
+    opacity: 0.22,
+  },
+  itemBody: {
+    position: 'absolute',
+    left: ms(100),
+    top: ms(20),
+    right: ms(36),
+  },
+  itemTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    minHeight: ms(24),
+  },
+  itemName: {
+    flexShrink: 1,
+    maxWidth: ms(170),
+    color: COLORS.ink,
+    fontSize: sp(16),
+    fontWeight: '700',
+  },
+  itemIdText: {
+    marginLeft: ms(5),
+    color: COLORS.linkBlue,
+    fontSize: sp(12),
+    fontWeight: '700',
+  },
+  itemDescription: {
+    marginTop: ms(20),
+    maxWidth: ms(250),
+    color: COLORS.lightGray,
+    fontSize: sp(12),
+  },
+  quantityRow: {
+    position: 'absolute',
+    left: ms(100),
+    top: ms(97),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  quantityLabel: {
+    marginLeft: ms(10),
+    color: COLORS.ink,
+    fontSize: sp(14),
+  },
+  quantityValue: {
+    marginLeft: ms(3),
+    color: COLORS.statusRejected,
+    fontSize: sp(14),
+  },
+  actionColumn: {
+    position: 'absolute',
+    top: ms(25),
+    right: ms(10),
+    width: ms(36),
+    alignItems: 'flex-end',
+  },
+  actionButton: {
+    minWidth: ms(34),
+    minHeight: ms(20),
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+    marginBottom: ms(15),
+  },
+  iconFrame: {
+    width: ms(22),
+    height: ms(22),
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  editBox: {
+    position: 'absolute',
+    left: ms(2),
+    bottom: ms(2),
+    width: ms(15),
+    height: ms(15),
+    borderWidth: ms(2),
+    borderRadius: ms(3),
+  },
+  editPencil: {
+    position: 'absolute',
+    right: ms(1),
+    top: ms(3),
+    width: ms(14),
+    height: ms(4),
+    borderRadius: ms(2),
+    transform: [{rotate: '-45deg'}],
+  },
+  editPencilTip: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    width: 0,
+    height: 0,
+    borderTopWidth: ms(3),
+    borderBottomWidth: ms(3),
+    borderLeftWidth: ms(5),
+    borderTopColor: 'transparent',
+    borderBottomColor: 'transparent',
+    transform: [{rotate: '-45deg'}],
+  },
+  optionBox: {
+    position: 'absolute',
+    left: ms(3),
+    top: ms(5),
+    width: ms(15),
+    height: ms(13),
+    borderWidth: ms(2),
+    borderRadius: ms(3),
+  },
+  optionLid: {
+    position: 'absolute',
+    left: ms(6),
+    top: ms(2),
+    width: ms(10),
+    height: ms(4),
+    borderRadius: ms(2),
+  },
+  optionCheckStem: {
+    position: 'absolute',
+    right: ms(6),
+    bottom: ms(5),
+    width: ms(3),
+    height: ms(8),
+    borderRadius: ms(2),
+    transform: [{rotate: '45deg'}],
+  },
+  optionCheckArm: {
+    position: 'absolute',
+    right: ms(11),
+    bottom: ms(6),
+    width: ms(3),
+    height: ms(5),
+    borderRadius: ms(2),
+    transform: [{rotate: '-45deg'}],
+  },
+  deleteLid: {
+    position: 'absolute',
+    top: ms(3),
+    width: ms(16),
+    height: ms(3),
+    borderRadius: ms(2),
+  },
+  deleteBin: {
+    position: 'absolute',
+    top: ms(7),
+    width: ms(14),
+    height: ms(13),
+    borderWidth: ms(2),
+    borderTopWidth: 0,
+    borderBottomLeftRadius: ms(3),
+    borderBottomRightRadius: ms(3),
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: ms(3),
+    paddingTop: ms(3),
+  },
+  deleteLine: {
+    width: ms(2),
+    height: ms(8),
+    borderRadius: ms(1),
+  },
+  focRequestRow: {
+    minHeight: ms(54),
+    paddingHorizontal: ms(14),
+    paddingTop: ms(14),
+    paddingBottom: ms(4),
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+  },
+  focSearchBox: {
+    flex: 1,
+    minHeight: ms(44),
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: ms(1),
+    borderColor: '#E2E2E2',
+    borderRadius: ms(8),
+    paddingHorizontal: ms(10),
+    backgroundColor: '#FFFFFF',
+  },
+  requestButton: {
+    width: ms(96),
+    height: ms(34),
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: ms(8),
+    backgroundColor: THEME_PRIMARY,
+  },
+  requestButtonText: {
+    color: '#FFFFFF',
+    fontSize: sp(12),
+    fontWeight: '800',
+  },
+  focFilterRow: {
+    minHeight: ms(42),
+    paddingHorizontal: ms(14),
+    paddingBottom: ms(8),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  focFilter: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: ms(32),
+    justifyContent: 'center',
+    borderBottomWidth: ms(1),
+    borderBottomColor: '#D7D7D7',
+    marginRight: ms(10),
+  },
+  focFilterText: {
+    color: '#111827',
+    fontSize: sp(14),
+    fontWeight: '600',
+  },
+  refreshListButton: {
+    minWidth: ms(112),
+    minHeight: ms(34),
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+  },
+  refreshListText: {
+    color: THEME_PRIMARY,
+    fontSize: sp(13),
+    fontWeight: '800',
+  },
+  refreshListIcon: {
+    marginLeft: ms(5),
+    color: THEME_PRIMARY,
+    fontSize: sp(18),
+    fontWeight: '800',
+  },
+  focListContent: {
+    flexGrow: 1,
+    paddingHorizontal: ms(8),
+    paddingBottom: ms(112),
+  },
+  focCard: {
+    margin: ms(8),
+    borderRadius: ms(10),
+    backgroundColor: '#FFFFFF',
+    borderWidth: ms(1),
+    borderColor: '#EFEFEF',
+    elevation: 2,
+    shadowColor: '#000000',
+    shadowOpacity: 0.1,
+    shadowRadius: 5,
+    shadowOffset: {width: 0, height: 1},
+    overflow: 'hidden',
+  },
+  focTopRow: {
+    minHeight: ms(34),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  focStatusBadge: {
+    width: ms(90),
+    alignSelf: 'stretch',
+    justifyContent: 'center',
+    backgroundColor: THEME_PRIMARY,
+    paddingHorizontal: ms(10),
+  },
+  focStatusText: {
+    color: '#FFFFFF',
+    fontSize: sp(10),
+    fontWeight: '800',
+  },
+  focRequestNo: {
+    flex: 1,
+    minWidth: ms(54),
+    marginLeft: ms(10),
+    color: THEME_PRIMARY,
+    fontSize: sp(12),
+    fontWeight: '800',
+  },
+  focLabel: {
+    marginLeft: ms(8),
+    color: '#3B3B3B',
+    fontSize: sp(12),
+    fontWeight: '800',
+  },
+  focIssue: {
+    minWidth: ms(28),
+    marginLeft: ms(4),
+    color: THEME_PRIMARY,
+    fontSize: sp(12),
+    fontWeight: '800',
+  },
+  focDate: {
+    width: ms(78),
+    marginLeft: ms(4),
+    marginRight: ms(8),
+    color: '#9CA3AF',
+    fontSize: sp(12),
+    fontWeight: '700',
+  },
+  focTaskCode: {
+    marginTop: ms(8),
+    marginRight: ms(18),
+    alignSelf: 'flex-end',
+    color: THEME_PRIMARY,
+    fontSize: sp(12),
+    fontWeight: '800',
+  },
+  focNotesRow: {
+    marginHorizontal: ms(10),
+    marginTop: ms(15),
+    marginBottom: ms(14),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  focNotesLabel: {
+    color: '#3B3B3B',
+    fontSize: sp(13),
+  },
+  focNotes: {
+    flex: 1,
+    marginLeft: ms(10),
+    color: '#9CA3AF',
+    fontSize: sp(13),
+    lineHeight: sp(18),
+  },
+  focDeleteButton: {
+    width: ms(44),
+    minHeight: ms(30),
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  listFooter: {
+    paddingVertical: ms(18),
+  },
+  emptyState: {
+    flex: 1,
+    minHeight: ms(320),
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: ms(24),
+  },
+  emptyImage: {
+    width: ms(220),
+    height: ms(220),
+  },
+  emptyTitle: {
+    color: '#111827',
+    fontSize: sp(18),
+    fontWeight: '800',
+  },
+  emptyText: {
+    marginTop: ms(8),
+    color: '#6B7280',
+    fontSize: sp(13),
+    lineHeight: sp(19),
+    textAlign: 'center',
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: ms(22),
+  },
+  modalPanel: {
+    width: '100%',
+    maxWidth: ms(360),
+    maxHeight: '76%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: ms(8),
+    paddingVertical: ms(12),
+  },
+  modalTitle: {
+    color: '#111827',
+    fontSize: sp(17),
+    fontWeight: '700',
+    paddingHorizontal: ms(16),
+    paddingBottom: ms(8),
+  },
+  modalItem: {
+    minHeight: ms(44),
+    justifyContent: 'center',
+    paddingHorizontal: ms(16),
+  },
+  modalItemText: {
+    color: '#1F2937',
+    fontSize: sp(15),
+  },
+  modalHint: {
+    color: '#667085',
+    fontSize: sp(13),
+    paddingHorizontal: ms(16),
+    paddingVertical: ms(12),
+  },
+});
+
+export default ItemInventoryTabHostScreen;

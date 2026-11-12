@@ -1,0 +1,3364 @@
+import { numpadAccessoryId } from '../../components/NumpadDoneBar';
+// src/screens/admin/AddTaskModal.tsx
+
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {ensureSuccess} from '../../utils/apiResponse';
+import {formatTimeHHMMSS} from '../../utils/timeFormat';
+import {sanitizeDecimalInput} from '../../utils/decimal';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import {
+  ActivityIndicator,
+  Keyboard,
+  KeyboardAvoidingView,
+  PermissionsAndroid,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import DateTimePicker, {type DateTimePickerChangeEvent} from '@react-native-community/datetimepicker';
+import Modal from '../../components/AppModal';
+import OutlinedInput from '../../components/OutlinedInput';
+import PlaceSearchModal from '../../components/PlaceSearchModal';
+import {geocodeAddress as geocodeWithGoogle} from '../../utils/googleMaps';
+import {InvoiceIcon} from '../../components/FabIcons';
+import ContactBookButton from '../../components/ContactBookButton';
+import {useContactPicker} from '../../hooks/useContactPicker';
+import type {DeviceContact} from '../../utils/contactPicker';
+import {COLORS} from '../../theme/theme';
+import {ms, sp} from '../../utils/responsive';
+import {getCurrentUserId, getCurrentUserProfile, isIndiaCountryDetailsId} from '../../state/session';
+import AudioRecord from 'react-native-audio-record';
+import RNFS from 'react-native-fs';
+import Sound from 'react-native-sound';
+import {getAllUsersList} from '../../api/users/usersService';
+import type {UsersListResultData} from '../../api/users/users.types';
+import {getCustomerList, getCityList, getStateList} from '../../api/customerList/customerListService';
+import type {CityDTOResultData, CustomerListResultData, StateDTOResultData} from '../../api/customerList/customerList.types';
+import {getAdvanceServiceList} from '../../api/services/servicesService';
+import type {AdvanceServiceListDTOResultData} from '../../api/services/services.types';
+import {getQuoteBindList, getQuotationdetailsByQuoteId} from '../../api/quotation/quotationService';
+import type {QuoteBindListDTOResultData} from '../../api/quotation/quotation.types';
+import {getFsrBindList} from '../../api/fsrManagement/fsrManagementService';
+import type {FSRBindListDTOResultData} from '../../api/fsrManagement/fsrManagement.types';
+import {getLargeItemAssignedUnassigned} from '../../api/item/itemService';
+import type {ItemsListResultData} from '../../api/item/item.types';
+import {getTaskTagList, reassignTaskNew, updateTask} from '../../api/task/taskService';
+import type {TasksListResultData} from '../../api/task/task.types';
+import type {TagListResultData} from '../../api/task/task.types';
+import {addTask} from '../../api/taskList/taskListService';
+import {
+  getTaskWarrantyTypeList,
+  searchBrands,
+  searchModels,
+  searchSerialNumbers,
+} from '../../api/brandModel/brandModelService';
+import SearchPickerModal, {type PickerOption} from '../../components/SearchPickerModal';
+import type {AddTaskResultData, AddTaskMultipleItemAssigned} from '../../api/taskList/taskList.types';
+import {
+  THEME_PRIMARY,
+  buildServiceTree,
+  extractArray,
+  filterCustomerOptions,
+  filterLookupOptions,
+  filterServiceTree,
+  getTaskStartTimeString,
+  getNumberField,
+  getStringField,
+  getTodayDateString,
+  normalizeCityOption,
+  normalizeCustomerOption,
+  normalizeStateOption,
+  normalizeTaskTag,
+  styles as sharedStyles,
+  type CityOption,
+  type CustomerOption,
+  type ServiceNode,
+  type StateOption,
+  type TaskTagOption,
+} from './crmShared';
+import { showFailureMsg, showSuccessMsg } from '../../utils/toast';
+import DecimalInput from '../../components/DecimalInput';
+
+import {useTranslation} from 'react-i18next';
+import {trf, tr} from '../../i18n/tr';
+Sound.setCategory('Playback');
+
+const BORDER = COLORS.lightGray; // TextInputLayoutStyle boxStrokeColor
+const ERROR_BORDER = '#D32F2F';
+type TaskFieldKey =
+  | 'title' | 'date' | 'time' | 'fieldworker' | 'tag' | 'address' | 'landmark'
+  | 'state' | 'city' | 'pinCode' | 'customerName' | 'customerNumber' | 'email' | 'rate'
+  | 'specialInstructions' | 'warrantyEnd';
+const SEGMENT_DARK = COLORS.ink; // SegmentedGroup sc_tint_color @color/background_gray
+
+// dialog_add_task_new.xml: 20dp margins, Material outlined (34dp-radius) fields with the 20dp
+// error row reserved under each, 40dp spinners, 40dp SegmentedGroups. Overrides the CRM-wide
+// styles (shared with the other CRM modals) for this form only.
+export const taskStyles = StyleSheet.create({
+  dateBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: ms(16),
+  },
+  dateSheet: {
+    backgroundColor: '#fff',
+    borderRadius: ms(20),
+    width: '100%',
+    maxWidth: ms(400),
+    paddingTop: ms(16),
+    paddingBottom: ms(12),
+    paddingHorizontal: ms(12),
+    elevation: 10,
+  },
+  dateSheetTitle: {
+    fontSize: sp(18),
+    fontWeight: '600',
+    color: '#1C1C1E',
+    textAlign: 'center',
+    marginBottom: ms(8),
+  },
+  dateSheetActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: ms(12),
+    paddingHorizontal: ms(8),
+    gap: ms(12),
+  },
+  dateCancelBtn: {
+    flex: 1,
+    height: ms(44),
+    borderRadius: ms(30),
+    borderWidth: 1,
+    borderColor: '#a6a6a6',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dateCancelText: {
+    fontSize: sp(16),
+    color: '#555',
+    fontWeight: '500',
+  },
+  dateConfirmBtn: {
+    flex: 1,
+    height: ms(44),
+    borderRadius: ms(30),
+    backgroundColor: COLORS.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dateConfirmText: {
+    fontSize: sp(16),
+    color: '#fff',
+    fontWeight: '600',
+  },
+  modalSheet: {
+    backgroundColor: '#FFFFFF',
+    width: '100%',
+    maxWidth: ms(560),
+    alignSelf: 'center',
+    maxHeight: '94%',
+    borderTopLeftRadius: ms(25),
+    borderTopRightRadius: ms(25),
+    overflow: 'hidden',
+  },
+  // gradient_addtask header (#353935, 20dp corners), 60dp tall, 22sp title.
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: COLORS.statusOnHold,
+    paddingHorizontal: ms(20),
+    height: ms(60),
+    borderRadius: ms(20),
+  },
+  modalHeaderTitle: {
+    color: '#FFFFFF',
+    fontSize: sp(22),
+    fontWeight: '400',
+  },
+  modalCloseIcon: {
+    color: '#FFFFFF',
+    fontSize: sp(26),
+    marginRight: ms(2),
+  },
+  modalScrollContent: {
+    paddingHorizontal: ms(20),
+    paddingTop: ms(12),
+    paddingBottom: ms(30),
+  },
+  fieldWrap: {
+    marginBottom: ms(26),
+    position: 'relative',
+    zIndex: 1,
+  },
+  fieldRow: {
+    flexDirection: 'row',
+    gap: ms(10),
+    marginBottom: ms(26),
+  },
+  // Date/Time row sits 10dp below the title field's reserved error row.
+  dateRow: {
+    marginTop: ms(8),
+    marginBottom: ms(25),
+  },
+  stateCityFieldRow: {
+    gap: ms(20),
+    zIndex: 20,
+    elevation: 20,
+  },
+  pillInput: {
+    borderWidth: ms(1),
+    borderColor: BORDER,
+    borderRadius: ms(34),
+    paddingHorizontal: ms(18),
+    paddingVertical: 0,
+    height: ms(41),
+    fontSize: sp(16),
+    color: COLORS.ink,
+  },
+  // AutoCompleteTextView (autoComplete_cust_name / edittext_customer_number): no explicit
+  // textColor, so the typed text renders in the muted theme gray.
+  pillInputMuted: {
+    color: COLORS.lightGray,
+  },
+  halfField: {
+    flex: 1,
+  },
+  dropdownPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderWidth: ms(1),
+    borderColor: BORDER,
+    borderRadius: ms(34),
+    paddingHorizontal: ms(12),
+    height: ms(40),
+    marginBottom: ms(16),
+  },
+  dropdownPillTextPlaceholder: {
+    fontSize: sp(14),
+    color: COLORS.darkGray,
+    flex: 1,
+  },
+  dropdownPillTextValue: {
+    fontSize: sp(14),
+    color: COLORS.ink,
+    flex: 1,
+  },
+  dropdownChevron: {
+    fontSize: sp(20),
+    color: COLORS.ink,
+    marginLeft: ms(6),
+  },
+  // Spinner right under the tag spinner / wages row (spin_technicians has 10dp top margin).
+  technicianPill: {
+    marginTop: 0,
+    marginBottom: ms(24),
+  },
+  // spin_tag has 16dp below it + the segmented group's 5dp top margin.
+  tagPill: {
+    marginBottom: ms(22),
+  },
+  warrantyRow: {
+    flexDirection: 'row',
+    gap: ms(10),
+    marginBottom: ms(26),
+  },
+  // SegmentedGroup: one 1dp outer border (25dp corners) with 1dp dividers between segments.
+  warrantyToggleGroup: {
+    flex: 1,
+    flexDirection: 'row',
+    height: ms(40),
+    marginLeft: ms(5),
+    borderRadius: ms(25),
+    borderWidth: 1,
+    borderColor: SEGMENT_DARK,
+    overflow: 'hidden',
+  },
+  warrantyToggleButton: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
+    borderWidth: 0,
+    paddingHorizontal: ms(4),
+  },
+  warrantyToggleButtonLeft: {
+    borderRightWidth: 1,
+    borderRightColor: SEGMENT_DARK,
+    borderRadius: 0,
+  },
+  warrantyToggleButtonRight: {
+    borderLeftWidth: 0,
+    borderRadius: 0,
+  },
+  warrantyToggleButtonActive: {
+    backgroundColor: SEGMENT_DARK,
+  },
+  warrantyToggleText: {
+    fontSize: sp(14),
+    fontWeight: '400',
+    color: SEGMENT_DARK,
+    textAlign: 'center',
+  },
+  warrantyToggleTextActive: {
+    fontSize: sp(14),
+    fontWeight: '400',
+    color: '#FFFFFF',
+    textAlign: 'center',
+  },
+  amcDisabledField: {
+    flex: 1,
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  amcDisabledInput: {
+    borderWidth: ms(1),
+    borderColor: BORDER,
+    borderRadius: ms(34),
+    paddingHorizontal: ms(18),
+    paddingVertical: 0,
+    height: ms(41),
+    fontSize: sp(16),
+    color: COLORS.lightGray,
+    backgroundColor: '#FFFFFF',
+  },
+  amcPlaceholderOverlay: {
+    position: 'absolute',
+    left: ms(18),
+    right: ms(18),
+    fontSize: sp(16),
+    color: COLORS.lightGray,
+  },
+  amcEnabledInput: {
+    borderColor: BORDER,
+    color: COLORS.ink,
+    backgroundColor: '#FFFFFF',
+  },
+  // spinWarranty / start-end dates follow the wages row.
+  warrantyTypePill: {
+    marginTop: ms(4),
+    marginBottom: ms(26),
+  },
+  warrantyDatesRow: {
+    marginTop: ms(4),
+  },
+  // Brand/Model/Serial: spinners with 10dp start / 5dp inner margins, i.e. 10dp wider than the
+  // 20dp column on the left.
+  productRow: {
+    flexDirection: 'row',
+    gap: ms(10),
+    marginLeft: -ms(10),
+    marginBottom: ms(16),
+  },
+  productPill: {
+    marginBottom: 0,
+  },
+  productSerialRow: {
+    marginBottom: ms(10),
+  },
+  taskFormTabsRow: {
+    flexDirection: 'row',
+    borderWidth: 1,
+    borderColor: SEGMENT_DARK,
+    borderRadius: ms(25),
+    overflow: 'hidden',
+    marginBottom: ms(20),
+  },
+  taskFormTabButton: {
+    flex: 1,
+    height: ms(40),
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
+    borderLeftWidth: 0,
+  },
+  taskFormTabDivider: {
+    borderLeftWidth: 1,
+    borderLeftColor: SEGMENT_DARK,
+  },
+  taskFormTabButtonActive: {
+    backgroundColor: SEGMENT_DARK,
+  },
+  taskFormTabText: {
+    fontSize: sp(14),
+    fontWeight: '400',
+    color: SEGMENT_DARK,
+  },
+  taskFormTabTextActive: {
+    fontSize: sp(14),
+    fontWeight: '400',
+    color: '#FFFFFF',
+  },
+  customerNameWrap: {
+    marginBottom: ms(21),
+  },
+  pillInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  phonebookButton: {
+    position: 'absolute',
+    right: ms(15),
+    top: 0,
+    bottom: 0,
+    justifyContent: 'center',
+  },
+  // button_add: rounded_button_new (#353935), 18sp white text, ic_terms drawableLeft.
+  darkAddButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.statusOnHold,
+    borderRadius: ms(24),
+    height: ms(48),
+    marginTop: ms(10),
+    marginBottom: ms(20),
+    elevation: 4,
+  },
+  addButtonIconWrap: {
+    position: 'absolute',
+    left: ms(17),
+  },
+  darkAddButtonText: {
+    color: '#FFFFFF',
+    fontSize: sp(18),
+    fontWeight: '500',
+  },
+  // button_cancel: transparent, 18sp colorPrimary, not all-caps.
+  cancelText: {
+    textAlign: 'center',
+    textAlignVertical: 'center',
+    color: COLORS.primary,
+    fontSize: sp(18),
+    fontWeight: '500',
+    height: ms(48),
+    lineHeight: ms(48),
+    marginBottom: ms(20),
+  },
+});
+
+const styles = {...sharedStyles, ...taskStyles};
+
+export type AddTaskInitialValues = {
+  title: string;
+  address: string;
+  state: string;
+  city: string;
+  pinCode: string;
+  landmark: string;
+  customerName: string;
+  customerNumber: string;
+  taskTagId: number;
+  taskTagName: string;
+  // Optional AMC-service prefill (used when adding a task from AMCDetailsScreen,
+  // matching Java's AMCDetailsFragment -> HomeActivityNew.addTask(...) flow).
+  customerId?: number;
+  /** Lead the task is raised from (Java addTaskFromLeadDetailsTech: addTask.setLeadId). */
+  leadId?: number;
+  productBrand?: string;
+  modelNumber?: string;
+  amcServiceDetailsId?: number;
+  // Self-assignment lock, used by the technician-side Routine Service flow
+  // (mirrors Java's TaskDialogNew.startTaskSelfCreation, which hardcodes
+  // the assignee to the logged-in user with no fieldworker picker).
+  assignedFieldworkerId?: number;
+  assignedFieldworkerName?: string;
+  lockAssignedFieldworker?: boolean;
+  // Edit / re-assign an existing task. Built by buildTaskFormValues() from a
+  // task-list row; see TaskFormMode for which Java dialog each mode mirrors.
+  mode?: TaskFormMode;
+  sourceTaskId?: number;
+  newTaskId?: string;
+  taskDate?: string;
+  taskTime?: string;
+  email?: string;
+  serialNo?: string;
+  wagesPerHour?: number;
+  paymentModeId?: number;
+  description?: string;
+  locationId?: number;
+  latitude?: string;
+  longitude?: string;
+  items?: {itemId: number; itemName: string; quantity: number}[];
+  warranty?: {
+    typeId: number;
+    typeName: string;
+    brandId: number;
+    brandName: string;
+    modelId: number;
+    modelName: string;
+    serialId: number;
+    serialName: string;
+    startDate: string;
+    endDate: string;
+  };
+  fsrId?: number;
+  fsrName?: string;
+};
+
+/**
+ * - 'add': new task (addTaskDialog -> Task/AddTask).
+ * - 'edit': InActive task, TaskDialogNew.updateTaskDialog -> Task/UpdateTaskDetailsByTaskID.
+ * - 'reassign': Rejected / OnHold task, reAssignTaskDialog / reAssignOnholdTaskDialog
+ *   -> Task/ReassignTask (same Id, TaskStatus 4).
+ * - 'reassignCompleted': Completed task, reAssignCompletedTaskDialog -> Task/AddTask
+ *   with Id 0 and OnHoldTaskId = the completed task's Id.
+ */
+export type TaskFormMode = 'add' | 'edit' | 'reassign' | 'reassignCompleted';
+
+const toDateOnly = (value: string) => value.split('T')[0];
+
+// The API returns the literal "NA" for missing emails. Treat it as empty so it is never shown in the field.
+const normalizeEmail = (value: unknown): string => {
+  const text = String(value ?? '').trim();
+  return text.toUpperCase() === 'NA' ? '' : text;
+};
+
+/** Prefill for edit / re-assign, from a task-list row (TasksList.ResultData). */
+export const buildTaskFormValues = (
+  task: TasksListResultData,
+  mode: Exclude<TaskFormMode, 'add'>,
+): AddTaskInitialValues => {
+  const record = task as Record<string, unknown>;
+  const warranty =
+    ((record.TaskWarrantyDetailsModelDtoView ?? record.taskWarrantyDetailsModelDtoView) as
+      | Record<string, unknown>
+      | undefined) ?? {};
+  const items = Array.isArray(task.MultipleItemAssigned) ? task.MultipleItemAssigned : [];
+  return {
+    mode,
+    sourceTaskId: Number(task.Id) || 0,
+    newTaskId: String(task.NewTaskId ?? ''),
+    title: String(task.Name ?? ''),
+    taskDate: toDateOnly(String(task.TaskDate ?? '')),
+    taskTime: formatTimeHHMMSS(task.TaskTime),
+    address: String(task.FullAddress ?? ''),
+    state: String(task.State ?? ''),
+    city: String(task.CityName ?? ''),
+    pinCode: String(task.PinCode ?? task.Zipcode ?? ''),
+    landmark: String(task.LocationDesc ?? ''),
+    customerId: Number(task.CustomerDetailsid) || 0,
+    customerName: String(task.CustomerName ?? ''),
+    customerNumber: String(task.ContactNo ?? ''),
+    email: normalizeEmail(task.CustomerEmailId),
+    taskTagId: Number(task.Task_TagId) || 0,
+    taskTagName: String(task.Task_TagName ?? ''),
+    assignedFieldworkerId: Number(task.UserId) || undefined,
+    assignedFieldworkerName: String(task.FirstNameLastName ?? task.AssignedTo ?? ''),
+    productBrand: String(task.BrandName ?? ''),
+    modelNumber: String(task.ModelNumber ?? ''),
+    serialNo: getStringField(warranty, ['serialNoName', 'SerialNoName']),
+    wagesPerHour: Number(task.WagesPerHours) || 0,
+    paymentModeId: Number(task.PaymentModeId) || 0,
+    description: String(task.Description ?? ''),
+    locationId: Number(task.LocationId) || 0,
+    latitude: String(task.Latitude ?? ''),
+    longitude: String(task.Longitude ?? ''),
+    items: items.map(item => ({
+      itemId: Number(item.ItemId) || 0,
+      itemName: String(item.ItemName ?? ''),
+      quantity: Number(item.ItemQuantity) || 0,
+    })),
+    warranty: {
+      typeId: getNumberField(warranty, ['warrantyTypeId', 'WarrantyTypeId']),
+      typeName: getStringField(warranty, ['warrantyTypeName', 'WarrantyTypeName']),
+      brandId: getNumberField(warranty, ['brandId', 'BrandId']),
+      brandName: getStringField(warranty, ['brandName', 'BrandName']),
+      modelId: getNumberField(warranty, ['modelId', 'ModelId']),
+      modelName: getStringField(warranty, ['modelName', 'ModelName']),
+      serialId: getNumberField(warranty, ['serialNoId', 'SerialNoId']),
+      serialName: getStringField(warranty, ['serialNoName', 'SerialNoName']),
+      startDate: toDateOnly(getStringField(warranty, ['startDate', 'StartDate'])),
+      endDate: toDateOnly(getStringField(warranty, ['endDate', 'EndDate'])),
+    },
+    fsrId: Number(task.FSRId) || 0,
+    fsrName: String(task.FSRName ?? ''),
+  };
+};
+
+type AddTaskModalProps = {
+  visible: boolean;
+  onClose: () => void;
+  ownerId: number;
+  initialValues?: AddTaskInitialValues | null;
+  /** Called after a successful add / update / re-assign (e.g. to refresh a list). */
+  onSaved?: () => void;
+};
+
+type TaskFormTabKey = 'cust' | 'items' | 'service' | 'quote' | 'fsr' | 'inst';
+
+const TASK_FORM_TABS: {key: TaskFormTabKey; label: string}[] = [
+  {key: 'cust', label: 'Cust.'},
+  {key: 'items', label: 'Items'},
+  {key: 'service', label: 'Service'},
+  {key: 'quote', label: 'Quote'},
+  {key: 'fsr', label: 'FSR'},
+  {key: 'inst', label: 'Inst.'},
+];
+
+const getFieldworkerName = (item: UsersListResultData) => {
+  const record = item as Record<string, unknown>;
+  const fullName = `${getStringField(record, [
+    'firstName',
+    'FirstName',
+  ])} ${getStringField(record, ['lastName', 'LastName'])}`.trim();
+
+  // FirstName/LastName first -- this endpoint's UserName is the login
+  // username, which in this app is the technician's phone number, not a
+  // display name. Only fall back to it if there's truly no name on file.
+  return (
+    fullName ||
+    getStringField(record, ['employeeName', 'EmployeeName']) ||
+    getStringField(record, ['name', 'Name']) ||
+    getStringField(record, ['userName', 'UserName']) ||
+    'Fieldworker'
+  );
+};
+
+const getFieldworkerId = (item: UsersListResultData) => {
+  const record = item as Record<string, unknown>;
+  const value = record.userId ?? record.UserId ?? record.id ?? record.Id;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+// Java: Constant.UserGroupId.FIELDWORKERID = 2. Users/AllUsersList takes a
+// RoleId query param (Java's own Add Task dialog calls it with RoleId=0 --
+// "everyone" -- which is why the original app's own assignee picker shows
+// every role too; we pass RoleId=2 instead to actually scope this to
+// fieldworkers). Kept as a client-side safety net in case the server doesn't
+// honor that filter, using this DTO's real Role/RoleId fields (unlike
+// Expenditure/GetTechnicianList's DTO, which has no role field at all).
+export const isFieldworkerRecord = (item: UsersListResultData) => {
+  const record = item as Record<string, unknown>;
+  const roleId = record.RoleId ?? record.UserGroupCodeId ?? record.UserGroupId;
+  if (roleId !== undefined && roleId !== null && String(roleId).trim() !== '') {
+    return Number(roleId) === 2;
+  }
+  const roleName = String(record.Role ?? record.UserGroupName ?? '').toLowerCase();
+  if (roleName) {
+    return roleName.includes('field') || roleName.includes('technician');
+  }
+  return true;
+};
+
+type ItemOption = {
+  id: number;
+  name: string;
+  availableQuantity: number;
+};
+
+const normalizeItemOption = (item: ItemsListResultData): ItemOption => {
+  const record = item as Record<string, unknown>;
+  return {
+    id: getNumberField(record, ['itemId', 'ItemId', 'id', 'Id']),
+    name: getStringField(record, ['itemName', 'ItemName', 'name', 'Name']),
+    availableQuantity: getNumberField(record, [
+      'availableQuantity',
+      'AvailableQuantity',
+      'availableQty',
+      'AvailableQty',
+      'unAssignedQuantity',
+      'UnAssignedQuantity',
+      'quantity',
+      'Quantity',
+    ]),
+  };
+};
+
+type QuoteOption = {
+  id: number;
+  label: string;
+};
+
+const normalizeQuoteOption = (item: QuoteBindListDTOResultData): QuoteOption => ({
+  id: getNumberField(item as Record<string, unknown>, [
+    'quotationId',
+    'QuotationId',
+    'quoteId',
+    'QuoteId',
+    'id',
+    'Id',
+  ]),
+  label: getStringField(item as Record<string, unknown>, [
+    'quotationTitle',
+    'QuotationTitle',
+    'quoteTitle',
+    'QuoteTitle',
+    'title',
+    'Title',
+    'subject',
+    'Subject',
+    'quotationName',
+    'QuotationName',
+    'quoteName',
+    'QuoteName',
+    'name',
+    'Name',
+  ]),
+});
+
+type FSROption = {
+  id: number;
+  label: string;
+};
+
+const normalizeFSROption = (item: FSRBindListDTOResultData): FSROption => ({
+  id: getNumberField(item as Record<string, unknown>, [
+    'fsrId',
+    'FSRId',
+    'fsrNumber',
+    'FSRNumber',
+    'id',
+    'Id',
+  ]),
+  label: getStringField(item as Record<string, unknown>, [
+    'fsrTitle',
+    'FSRTitle',
+    'fsrName',
+    'FSRName',
+    'fsrNo',
+    'FSRNo',
+    'title',
+    'Title',
+    'subject',
+    'Subject',
+    'name',
+    'Name',
+  ]),
+});
+
+type TaskItemRow = {
+  rowId: string;
+  itemId: number;
+  itemName: string;
+  availableQuantity: number;
+  quantity: string;
+};
+
+let taskItemRowSequence = 0;
+const createEmptyTaskItemRow = (): TaskItemRow => {
+  taskItemRowSequence += 1;
+  return {
+    rowId: `item-row-${taskItemRowSequence}`,
+    itemId: 0,
+    itemName: '',
+    availableQuantity: 0,
+    quantity: '',
+  };
+};
+
+const AddTaskModal: React.FC<AddTaskModalProps> = ({
+  visible,
+  onClose,
+  ownerId,
+  initialValues,
+  onSaved,
+}) => {
+  const {t} = useTranslation();
+  const formMode: TaskFormMode = initialValues?.mode ?? 'add';
+  // Java titles/buttons: addTaskDialog "Add Task"/Add, updateTaskDialog
+  // "Edit Task"/Update, the re-assign dialogs "Re-Assign"/Re-Assign.
+  const formTitle =
+    formMode === 'edit' ? 'Edit Task' : formMode === 'add' ? 'Add Task' : 'Re-Assign';
+  const submitLabel =
+    formMode === 'edit' ? 'UPDATE' : formMode === 'add' ? 'ADD' : 'RE-ASSIGN';
+  const [taskTitle, setTaskTitle] = useState('');
+  const [taskDate, setTaskDate] = useState(getTodayDateString());
+  const [taskTime, setTaskTime] = useState(getTaskStartTimeString());
+  // Java DateUtils.datePicker / timePicker: native dialogs behind the read-only date fields.
+  const [taskPicker, setTaskPicker] = useState<'date' | 'time' | 'start' | 'end' | null>(null);
+  const [taskPickerValue, setTaskPickerValue] = useState(new Date());
+  const [selectedFieldworker, setSelectedFieldworker] = useState<{
+    id: number;
+    name: string;
+  } | null>(null);
+  const [isFieldworkerModalOpen, setIsFieldworkerModalOpen] = useState(false);
+  const [allFieldworkers, setAllFieldworkers] = useState<
+    UsersListResultData[]
+  >([]);
+  const [isFieldworkerLoading, setIsFieldworkerLoading] = useState(false);
+
+  const [taskTags, setTaskTags] = useState<TaskTagOption[]>([]);
+  const [isTaskTagLoading, setIsTaskTagLoading] = useState(false);
+  const [isAddTaskTagModalOpen, setIsAddTaskTagModalOpen] = useState(false);
+  const [selectedAddTaskTag, setSelectedAddTaskTag] =
+    useState<TaskTagOption | null>(null);
+
+  const [warrantyMode, setWarrantyMode] = useState<'in' | 'out'>('in');
+  const [amcAmount, setAmcAmount] = useState('');
+  const [taskAmcServiceDetailsId, setTaskAmcServiceDetailsId] = useState(0);
+
+  const [taskAddress, setTaskAddress] = useState('');
+  const [taskState, setTaskState] = useState('');
+  const [taskStateId, setTaskStateId] = useState(0);
+  const [taskCity, setTaskCity] = useState('');
+  const [taskCityId, setTaskCityId] = useState(0);
+  const [taskPinCode, setTaskPinCode] = useState('');
+  const [taskLandmark, setTaskLandmark] = useState('');
+  const [taskProductBrand, setTaskProductBrand] = useState('');
+  const [taskModelNumber, setTaskModelNumber] = useState('');
+  const [taskEmail, setTaskEmail] = useState('');
+  const [taskSerialNo, setTaskSerialNo] = useState('');
+  const [selectedBrand, setSelectedBrand] = useState<PickerOption | null>(null);
+  const [selectedModel, setSelectedModel] = useState<PickerOption | null>(null);
+  const [selectedSerial, setSelectedSerial] = useState<PickerOption | null>(null);
+  const [selectedWarrantyType, setSelectedWarrantyType] = useState<PickerOption | null>(null);
+  const [warrantyStartDate, setWarrantyStartDate] = useState('');
+  const [warrantyEndDate, setWarrantyEndDate] = useState('');
+  // Which searchable product picker (Java's brand/model/serial/warranty
+  // spinner dialogs) is open, and its current options.
+  const [productPicker, setProductPicker] = useState<'brand' | 'model' | 'serial' | 'warranty' | null>(null);
+  const [productPickerOptions, setProductPickerOptions] = useState<PickerOption[]>([]);
+  const [isProductPickerLoading, setIsProductPickerLoading] = useState(false);
+  const [isPlaceSearchOpen, setIsPlaceSearchOpen] = useState(false);
+  const [taskLatitude, setTaskLatitude] = useState('');
+  const [taskLongitude, setTaskLongitude] = useState('');
+
+  const [activeTaskFormTab, setActiveTaskFormTab] =
+    useState<TaskFormTabKey>('cust');
+
+  const [taskCustomerId, setTaskCustomerId] = useState(0);
+  // Java: locationID is the picked customer's own location record, 0 for a new customer
+  // ("FOR NEW CUSTOMER PASS 0"). It is NOT the city id.
+  const [taskLocationId, setTaskLocationId] = useState(0);
+  const [taskCustomerName, setTaskCustomerName] = useState('');
+  const [taskCustomerNumber, setTaskCustomerNumber] = useState('');
+  const [taskCustomerSuggestions, setTaskCustomerSuggestions] = useState<
+    CustomerOption[]
+  >([]);
+  const [showTaskCustomerSuggestions, setShowTaskCustomerSuggestions] =
+    useState(false);
+  const [showTaskNumberSuggestions, setShowTaskNumberSuggestions] = useState(false);
+  const [allCustomerOptions, setAllCustomerOptions] = useState<
+    CustomerOption[]
+  >([]);
+  const [isCustomerLoading, setIsCustomerLoading] = useState(false);
+
+  const [allStateOptions, setAllStateOptions] = useState<StateOption[]>([]);
+  const [isStateLoading, setIsStateLoading] = useState(false);
+  const [taskStateSuggestions, setTaskStateSuggestions] = useState<
+    StateOption[]
+  >([]);
+  const [showTaskStateSuggestions, setShowTaskStateSuggestions] =
+    useState(false);
+
+  const [taskAllCityOptions, setTaskAllCityOptions] = useState<CityOption[]>(
+    [],
+  );
+  const [isTaskCityLoading, setIsTaskCityLoading] = useState(false);
+  const [taskCitySuggestions, setTaskCitySuggestions] = useState<
+    CityOption[]
+  >([]);
+  const [showTaskCitySuggestions, setShowTaskCitySuggestions] =
+    useState(false);
+
+  const [taskItemRows, setTaskItemRows] = useState<TaskItemRow[]>([
+    createEmptyTaskItemRow(),
+  ]);
+  const [activeItemRowId, setActiveItemRowId] = useState<string | null>(null);
+  const [isItemSearchModalOpen, setIsItemSearchModalOpen] = useState(false);
+  const [itemSearchQuery, setItemSearchQuery] = useState('');
+  const [allItemOptions, setAllItemOptions] = useState<ItemOption[]>([]);
+  const [isItemSearchLoading, setIsItemSearchLoading] = useState(false);
+
+  const [serviceTree, setServiceTree] = useState<ServiceNode[]>([]);
+  const [isServiceTypeLoading, setIsServiceTypeLoading] = useState(false);
+  const [serviceTypeError, setServiceTypeError] = useState('');
+  const [taskServiceTypeSearch, setTaskServiceTypeSearch] = useState('');
+  const [isTaskServiceModalOpen, setIsTaskServiceModalOpen] = useState(false);
+  const [selectedTaskService, setSelectedTaskService] =
+    useState<ServiceNode | null>(null);
+
+  const [quoteList, setQuoteList] = useState<QuoteOption[]>([]);
+  const [isQuoteLoading, setIsQuoteLoading] = useState(false);
+  const [quoteError, setQuoteError] = useState('');
+  const [isQuoteModalOpen, setIsQuoteModalOpen] = useState(false);
+  const [selectedQuote, setSelectedQuote] = useState<QuoteOption | null>(null);
+
+  const [fsrList, setFsrList] = useState<FSROption[]>([]);
+  const [isFsrLoading, setIsFsrLoading] = useState(false);
+  const [fsrError, setFsrError] = useState('');
+  const [isFsrModalOpen, setIsFsrModalOpen] = useState(false);
+  const [selectedFsr, setSelectedFsr] = useState<FSROption | null>(null);
+
+  const [isSubmittingTask, setIsSubmittingTask] = useState(false);
+  // Required-field errors from the last submit: the field's border turns red and the
+  // message (which names the field) is shown in the toast.
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<TaskFieldKey, string>>>({});
+  const errBorder = (key: TaskFieldKey) => (fieldErrors[key] ? {borderColor: ERROR_BORDER} : null);
+  // A field's error clears as soon as it has a value again.
+  useEffect(() => {
+    const filled: Partial<Record<TaskFieldKey, boolean>> = {
+      title: !!taskTitle, date: !!taskDate, time: !!taskTime, fieldworker: !!selectedFieldworker,
+      tag: !!selectedAddTaskTag, address: !!taskAddress, landmark: !!taskLandmark, state: !!taskState,
+      city: !!taskCity, pinCode: !!taskPinCode, customerName: !!taskCustomerName,
+      customerNumber: !!taskCustomerNumber, rate: !!amcAmount,
+    };
+    setFieldErrors(prev => {
+      const next = {...prev};
+      let changed = false;
+      (Object.keys(prev) as TaskFieldKey[]).forEach(key => {
+        if (filled[key]) {
+          delete next[key];
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [taskTitle, taskDate, taskTime, selectedFieldworker, selectedAddTaskTag, taskAddress,
+    taskLandmark, taskState, taskCity, taskPinCode, taskCustomerName, taskCustomerNumber, amcAmount]);
+
+  const [taskSpecialInstructions, setTaskSpecialInstructions] = useState('');
+  const [isRecordingInstruction, setIsRecordingInstruction] = useState(false);
+  const [isPlayingInstruction, setIsPlayingInstruction] = useState(false);
+  const [instructionRecordSeconds, setInstructionRecordSeconds] = useState(0);
+  const [instructionAudioPath, setInstructionAudioPath] = useState('');
+  const instructionTimerRef = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
+  const instructionSoundRef = useRef<Sound | null>(null);
+  const isAudioRecordInitialized = useRef(false);
+
+  useEffect(() => {
+    if (!visible) {
+      return;
+    }
+    setTaskTitle(initialValues?.title ?? '');
+    setTaskDate(initialValues?.taskDate || getTodayDateString());
+    setTaskTime(formatTimeHHMMSS(initialValues?.taskTime) || getTaskStartTimeString());
+    setSelectedFieldworker(
+      initialValues?.assignedFieldworkerId
+        ? {id: initialValues.assignedFieldworkerId, name: initialValues.assignedFieldworkerName ?? 'Me'}
+        : null,
+    );
+    const tagId = initialValues?.taskTagId ?? 0;
+    const tagName = initialValues?.taskTagName ?? '';
+    setSelectedAddTaskTag(
+      tagId || tagName ? {id: tagId, label: tagName || 'Task'} : null,
+    );
+    // PaymentModeId 2 = Rate (Out of Warranty), 1 = AMC (In Warranty).
+    setWarrantyMode(initialValues?.paymentModeId === 2 ? 'out' : 'in');
+    setAmcAmount(initialValues?.wagesPerHour ? String(initialValues.wagesPerHour) : '');
+    setTaskAmcServiceDetailsId(initialValues?.amcServiceDetailsId ?? 0);
+    setTaskAddress(initialValues?.address ?? '');
+    setTaskState(initialValues?.state ?? '');
+    setTaskStateId(0);
+    setTaskCity(initialValues?.city ?? '');
+    setTaskCityId(0);
+    setTaskAllCityOptions([]);
+    setTaskCitySuggestions([]);
+    setShowTaskStateSuggestions(false);
+    setShowTaskCitySuggestions(false);
+    setTaskPinCode(initialValues?.pinCode ?? '');
+    setTaskLandmark(initialValues?.landmark ?? '');
+    setTaskProductBrand(initialValues?.productBrand ?? '');
+    setTaskModelNumber(initialValues?.modelNumber ?? '');
+    setTaskEmail(normalizeEmail(initialValues?.email));
+    setTaskSerialNo(initialValues?.serialNo ?? '');
+    const w = initialValues?.warranty;
+    setSelectedBrand(w?.brandId ? {id: w.brandId, label: w.brandName} : null);
+    setSelectedModel(w?.modelId ? {id: w.modelId, label: w.modelName} : null);
+    setSelectedSerial(w?.serialId ? {id: w.serialId, label: w.serialName} : null);
+    setSelectedWarrantyType(w?.typeId ? {id: w.typeId, label: w.typeName} : null);
+    setWarrantyStartDate(w?.startDate ?? '');
+    setWarrantyEndDate(w?.endDate ?? '');
+    setProductPicker(null);
+    setTaskLatitude(initialValues?.latitude ?? '');
+    setTaskLongitude(initialValues?.longitude ?? '');
+    setActiveTaskFormTab('cust');
+    setTaskCustomerId(initialValues?.customerId ?? 0);
+    setTaskLocationId(initialValues?.locationId ?? 0);
+    setTaskCustomerName(initialValues?.customerName ?? '');
+    setTaskCustomerNumber(initialValues?.customerNumber ?? '');
+    setTaskCustomerSuggestions([]);
+    setShowTaskCustomerSuggestions(false);
+    setSelectedTaskService(null);
+    setTaskServiceTypeSearch('');
+    setSelectedQuote(null);
+    setSelectedFsr(
+      initialValues?.fsrId ? {id: initialValues.fsrId, label: initialValues.fsrName || 'FSR'} : null,
+    );
+    setTaskSpecialInstructions(initialValues?.description ?? '');
+    setInstructionAudioPath('');
+    setInstructionRecordSeconds(0);
+    setIsRecordingInstruction(false);
+    setIsPlayingInstruction(false);
+    const prefillItems = (initialValues?.items ?? []).filter(item => item.itemId > 0);
+    setTaskItemRows(
+      prefillItems.length
+        ? prefillItems.map(item => ({
+            ...createEmptyTaskItemRow(),
+            itemId: item.itemId,
+            itemName: item.itemName,
+            quantity: String(item.quantity),
+          }))
+        : [createEmptyTaskItemRow()],
+    );
+    setActiveItemRowId(null);
+    setIsItemSearchModalOpen(false);
+    setItemSearchQuery('');
+  }, [visible, initialValues]);
+
+  const openTaskPicker = (kind: 'date' | 'time' | 'start' | 'end') => {
+    const current =
+      kind === 'date' ? taskDate : kind === 'time' ? taskTime : kind === 'start' ? warrantyStartDate : warrantyEndDate || warrantyStartDate;
+    const base = new Date();
+    if (kind === 'time') {
+      const [h, m] = current.split(':').map(part => parseInt(part, 10));
+      if (!isNaN(h) && !isNaN(m)) {
+        base.setHours(h, m, 0, 0);
+      }
+    } else if (/^\d{4}-\d{2}-\d{2}$/.test(current.trim())) {
+      const parsed = new Date(`${current.trim()}T00:00:00`);
+      if (!isNaN(parsed.getTime())) {
+        base.setTime(parsed.getTime());
+      }
+    }
+    setTaskPickerValue(base);
+    setTaskPicker(kind);
+  };
+
+  const applyTaskPicker = (kind: 'date' | 'time' | 'start' | 'end', picked: Date) => {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    if (kind === 'time') {
+      setTaskTime(`${pad(picked.getHours())}:${pad(picked.getMinutes())}:00`);
+      return;
+    }
+    const formatted = `${picked.getFullYear()}-${pad(picked.getMonth() + 1)}-${pad(picked.getDate())}`;
+    if (kind === 'date') {
+      setTaskDate(formatted);
+    } else if (kind === 'start') {
+      setWarrantyStartDate(formatted);
+      // A start date after the chosen end date would leave the end before the start, so clear it.
+      if (warrantyEndDate && warrantyEndDate < formatted) {
+        setWarrantyEndDate('');
+        showFailureMsg('End date cleared because it was before the new start date.');
+      }
+    } else {
+      if (warrantyStartDate && formatted < warrantyStartDate) {
+        showFailureMsg('End date cannot be before start date.');
+        return;
+      }
+      setWarrantyEndDate(formatted);
+    }
+  };
+
+  const loadFieldworkers = useCallback(() => {
+    if (allFieldworkers.length > 0 || isFieldworkerLoading) {
+      return;
+    }
+    setIsFieldworkerLoading(true);
+    getAllUsersList({OwnerId: ownerId, RoleId: 2, OnlyList: false})
+      .then(response => {
+        setAllFieldworkers(
+          extractArray<UsersListResultData>(response).filter(isFieldworkerRecord),
+        );
+      })
+      .catch(() => setAllFieldworkers([]))
+      .finally(() => setIsFieldworkerLoading(false));
+  }, [allFieldworkers.length, isFieldworkerLoading, ownerId]);
+
+  const handleFieldworkerSelect = (item: UsersListResultData) => {
+    setSelectedFieldworker({
+      id: getFieldworkerId(item),
+      name: getFieldworkerName(item),
+    });
+    setIsFieldworkerModalOpen(false);
+  };
+
+  const loadTaskTags = useCallback(() => {
+    if (taskTags.length > 0 || isTaskTagLoading) {
+      return;
+    }
+    setIsTaskTagLoading(true);
+    getTaskTagList({userId: ownerId})
+      .then(response => {
+        const items = extractArray<TagListResultData>(response);
+        setTaskTags(
+          items
+            .map(normalizeTaskTag)
+            .filter(option => option.label && option.label !== 'Task'),
+        );
+      })
+      .catch(() => setTaskTags([]))
+      .finally(() => setIsTaskTagLoading(false));
+  }, [isTaskTagLoading, ownerId, taskTags.length]);
+
+  const loadServiceTypes = useCallback(() => {
+    if (serviceTree.length > 0 || isServiceTypeLoading) {
+      return;
+    }
+    setIsServiceTypeLoading(true);
+    setServiceTypeError('');
+    getAdvanceServiceList({
+      UserId: ownerId,
+      SearchParam: '',
+    })
+      .then(response => {
+        const items = extractArray<AdvanceServiceListDTOResultData>(response);
+        setServiceTree(
+          buildServiceTree(
+            items as unknown as Parameters<typeof buildServiceTree>[0],
+          ),
+        );
+      })
+      .catch(error => {
+        setServiceTree([]);
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Unable to load service types right now.';
+        setServiceTypeError(message);
+      })
+      .finally(() => setIsServiceTypeLoading(false));
+  }, [isServiceTypeLoading, ownerId, serviceTree.length]);
+
+  const loadQuoteList = useCallback(() => {
+    if (quoteList.length > 0 || isQuoteLoading) {
+      return;
+    }
+    setIsQuoteLoading(true);
+    setQuoteError('');
+    getQuoteBindList({
+      userId: ownerId,
+      searchParam: '',
+    })
+      .then(response => {
+        const items = extractArray<QuoteBindListDTOResultData>(response);
+        setQuoteList(
+          items.map(normalizeQuoteOption).filter(option => option.label),
+        );
+      })
+      .catch(error => {
+        setQuoteList([]);
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Unable to load quotes right now.';
+        setQuoteError(message);
+      })
+      .finally(() => setIsQuoteLoading(false));
+  }, [isQuoteLoading, ownerId, quoteList.length]);
+
+  const loadFsrList = useCallback(() => {
+    if (fsrList.length > 0 || isFsrLoading) {
+      return;
+    }
+    setIsFsrLoading(true);
+    setFsrError('');
+    getFsrBindList({
+      userId: ownerId,
+      searchParam: '',
+    })
+      .then(response => {
+        const items = extractArray<FSRBindListDTOResultData>(response);
+        setFsrList(
+          items.map(normalizeFSROption).filter(option => option.label),
+        );
+      })
+      .catch(error => {
+        setFsrList([]);
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Unable to load FSR list right now.';
+        setFsrError(message);
+      })
+      .finally(() => setIsFsrLoading(false));
+  }, [fsrList.length, isFsrLoading, ownerId]);
+
+  const MAX_INSTRUCTION_RECORD_SECONDS = 30;
+  const MAX_INSTRUCTION_CHARS = 4000;
+
+  const clearInstructionTimer = useCallback(() => {
+    if (instructionTimerRef.current) {
+      clearInterval(instructionTimerRef.current);
+      instructionTimerRef.current = null;
+    }
+  }, []);
+
+  const stopInstructionRecording = useCallback(async () => {
+    clearInstructionTimer();
+    if (!isRecordingInstruction) {
+      return;
+    }
+    try {
+      const audioFile = await AudioRecord.stop();
+      try {
+        const stat = await RNFS.stat(audioFile);
+        if (Number(stat.size) <= 44) {
+          console.warn('[AddTask] Recorded instruction file is empty', audioFile);
+          showFailureMsg(t('rn_recording_did_not_capture_any_audio_please'));
+          setInstructionAudioPath('');
+          return;
+        }
+      } catch (statError) {
+        console.warn('[AddTask] Recorded instruction file not found', statError);
+        showFailureMsg(t('rn_unable_to_save_the_recorded_instruction'));
+        setInstructionAudioPath('');
+        return;
+      }
+      setInstructionAudioPath(audioFile);
+    } catch (error) {
+      console.warn('[AddTask] Unable to save recorded instruction', error);
+      showFailureMsg(t('rn_unable_to_save_the_recorded_instruction'));
+    } finally {
+      setIsRecordingInstruction(false);
+    }
+  }, [clearInstructionTimer, isRecordingInstruction]);
+
+  const startInstructionRecording = useCallback(async () => {
+    if (isRecordingInstruction) {
+      return;
+    }
+    if (Platform.OS === 'android') {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+      );
+      if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+        showFailureMsg(t('rn_microphone_permission_is_required_to_recor'));
+        return;
+      }
+    }
+
+    if (instructionSoundRef.current) {
+      instructionSoundRef.current.stop();
+      instructionSoundRef.current.release();
+      instructionSoundRef.current = null;
+      setIsPlayingInstruction(false);
+    }
+
+    AudioRecord.init({
+      sampleRate: 44100,
+      channels: 1,
+      bitsPerSample: 16,
+      audioSource: 6,
+      wavFile: `task_instruction_${Date.now()}.wav`,
+    });
+    isAudioRecordInitialized.current = true;
+
+    setInstructionAudioPath('');
+    setInstructionRecordSeconds(0);
+    AudioRecord.start();
+    setIsRecordingInstruction(true);
+
+    instructionTimerRef.current = setInterval(() => {
+      setInstructionRecordSeconds(prev => {
+        const next = prev + 1;
+        if (next >= MAX_INSTRUCTION_RECORD_SECONDS) {
+          stopInstructionRecording();
+          return MAX_INSTRUCTION_RECORD_SECONDS;
+        }
+        return next;
+      });
+    }, 1000);
+  }, [isRecordingInstruction, stopInstructionRecording]);
+
+  const playInstructionRecording = useCallback(() => {
+    if (isRecordingInstruction) {
+      showFailureMsg(t('rn_please_stop_recording_first'));
+      return;
+    }
+    if (isPlayingInstruction) {
+      return;
+    }
+    if (!instructionAudioPath) {
+      showFailureMsg(t('rn_please_record_an_instruction_first'));
+      return;
+    }
+    if (instructionSoundRef.current) {
+      instructionSoundRef.current.stop();
+      instructionSoundRef.current.release();
+      instructionSoundRef.current = null;
+    }
+    const sound = new Sound(instructionAudioPath, '', error => {
+      if (error) {
+        console.warn('[AddTask] Unable to load recorded instruction', error);
+        showFailureMsg(t('rn_unable_to_play_the_recorded_instruction'));
+        instructionSoundRef.current = null;
+        return;
+      }
+      setIsPlayingInstruction(true);
+      sound.play(success => {
+        if (!success) {
+          console.warn('[AddTask] Playback finished unsuccessfully');
+        }
+        setIsPlayingInstruction(false);
+        sound.release();
+        instructionSoundRef.current = null;
+      });
+    });
+    instructionSoundRef.current = sound;
+  }, [instructionAudioPath, isRecordingInstruction, isPlayingInstruction]);
+
+  useEffect(() => {
+    if (!visible) {
+      clearInstructionTimer();
+      if (isRecordingInstruction && isAudioRecordInitialized.current) {
+        AudioRecord.stop().catch(() => {});
+      }
+      if (instructionSoundRef.current) {
+        instructionSoundRef.current.stop();
+        instructionSoundRef.current.release();
+        instructionSoundRef.current = null;
+      }
+      setIsRecordingInstruction(false);
+      setIsPlayingInstruction(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
+
+  const instructionTimerLabel = useMemo(() => {
+    const minutes = Math.floor(instructionRecordSeconds / 60);
+    const seconds = instructionRecordSeconds % 60;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(
+      2,
+      '0',
+    )}`;
+  }, [instructionRecordSeconds]);
+
+  const loadTaskCustomerSuggestions = useCallback(
+    async (query: string) => {
+      const trimmedQuery = query.trim();
+      if (trimmedQuery.length < 2) {
+        setTaskCustomerSuggestions([]);
+        return;
+      }
+
+      if (allCustomerOptions.length > 0) {
+        setTaskCustomerSuggestions(
+          filterCustomerOptions(allCustomerOptions, trimmedQuery),
+        );
+        return;
+      }
+
+      if (isCustomerLoading) {
+        return;
+      }
+
+      setIsCustomerLoading(true);
+      try {
+        const response =
+          await getCustomerList({
+          userId: ownerId,
+            customerTagId: 0,
+          });
+        const normalized = extractArray<CustomerListResultData>(response)
+          .map((item, index) =>
+            normalizeCustomerOption(
+              item as unknown as Parameters<typeof normalizeCustomerOption>[0],
+              index,
+            ),
+          )
+          .filter((option): option is CustomerOption => Boolean(option));
+        setAllCustomerOptions(normalized);
+        setTaskCustomerSuggestions(
+          filterCustomerOptions(normalized, trimmedQuery),
+        );
+      } catch {
+        setTaskCustomerSuggestions([]);
+      } finally {
+        setIsCustomerLoading(false);
+      }
+    },
+    [allCustomerOptions, isCustomerLoading, ownerId],
+  );
+
+  // Loads the full customer list (used by the phone-number suggestions) without needing a
+  // name query first.
+  const ensureCustomerList = useCallback(async () => {
+    if (allCustomerOptions.length > 0 || isCustomerLoading) {
+      return;
+    }
+    setIsCustomerLoading(true);
+    try {
+      const response = await getCustomerList({
+        userId: ownerId,
+        customerTagId: 0,
+      });
+      const normalized = extractArray<CustomerListResultData>(response)
+        .map((item, index) =>
+          normalizeCustomerOption(
+            item as unknown as Parameters<typeof normalizeCustomerOption>[0],
+            index,
+          ),
+        )
+        .filter((option): option is CustomerOption => Boolean(option));
+      setAllCustomerOptions(normalized);
+    } catch {
+      // Suggestions stay empty; the number can still be typed by hand.
+    } finally {
+      setIsCustomerLoading(false);
+    }
+  }, [allCustomerOptions.length, isCustomerLoading, ownerId]);
+
+  useEffect(() => {
+    const query = taskCustomerName.trim();
+    if (!showTaskCustomerSuggestions || query.length < 2) {
+      setTaskCustomerSuggestions([]);
+      return;
+    }
+
+    if (allCustomerOptions.length > 0) {
+      setTaskCustomerSuggestions(filterCustomerOptions(allCustomerOptions, query));
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      loadTaskCustomerSuggestions(query);
+    }, 300);
+
+    return () => clearTimeout(timeoutId);
+  }, [
+    allCustomerOptions,
+    taskCustomerName,
+    loadTaskCustomerSuggestions,
+    showTaskCustomerSuggestions,
+  ]);
+
+  const loadProductPickerOptions = useCallback(
+    async (kind: 'brand' | 'model' | 'serial' | 'warranty', search = '') => {
+      setIsProductPickerLoading(true);
+      try {
+        let options: PickerOption[] = [];
+        if (kind === 'brand') {
+          const response = await searchBrands({ownerId, search});
+          options = extractArray<{BrandId?: number; BrandName?: string}>(response).map(item => ({
+            id: Number(item.BrandId) || 0,
+            label: String(item.BrandName ?? ''),
+          }));
+        } else if (kind === 'model') {
+          const response = await searchModels({ownerId, BrandId: selectedBrand?.id ?? 0, search});
+          options = extractArray<{ModelId?: number; ModelName?: string}>(response).map(item => ({
+            id: Number(item.ModelId) || 0,
+            label: String(item.ModelName ?? ''),
+          }));
+        } else if (kind === 'serial') {
+          const response = await searchSerialNumbers({
+            BrandId: selectedBrand?.id ?? 0,
+            ModelId: selectedModel?.id ?? 0,
+            ownerId,
+            search,
+          });
+          options = extractArray<{SerialNoId?: number; SerialNo?: string}>(response).map(item => ({
+            id: Number(item.SerialNoId) || 0,
+            label: String(item.SerialNo ?? ''),
+          }));
+        } else {
+          const response = await getTaskWarrantyTypeList({ownerid: ownerId});
+          options = extractArray<{WarrantyTypeId?: number; WarrantyTypeName?: string}>(response).map(item => ({
+            id: Number(item.WarrantyTypeId) || 0,
+            label: String(item.WarrantyTypeName ?? ''),
+          }));
+        }
+        setProductPickerOptions(options.filter(option => option.label));
+      } catch {
+        setProductPickerOptions([]);
+      } finally {
+        setIsProductPickerLoading(false);
+      }
+    },
+    [ownerId, selectedBrand, selectedModel],
+  );
+
+  const openProductPicker = (kind: 'brand' | 'model' | 'serial' | 'warranty') => {
+    if (kind === 'model' && !selectedBrand) {
+      showFailureMsg(t('rn_please_select_a_brand_first'));
+      return;
+    }
+    if (kind === 'serial' && !selectedModel) {
+      showFailureMsg(t('rn_please_select_a_model_first'));
+      return;
+    }
+    setProductPickerOptions([]);
+    setProductPicker(kind);
+    loadProductPickerOptions(kind);
+  };
+
+  const handleProductPickerSelect = (option: PickerOption) => {
+    if (productPicker === 'brand') {
+      setSelectedBrand(option);
+      setTaskProductBrand(option.label);
+      // A new brand invalidates the model and serial chosen under the old one.
+      setSelectedModel(null);
+      setTaskModelNumber('');
+      setSelectedSerial(null);
+      setTaskSerialNo('');
+    } else if (productPicker === 'model') {
+      setSelectedModel(option);
+      setTaskModelNumber(option.label);
+      setSelectedSerial(null);
+      setTaskSerialNo('');
+    } else if (productPicker === 'serial') {
+      setSelectedSerial(option);
+      setTaskSerialNo(option.label);
+    } else if (productPicker === 'warranty') {
+      setSelectedWarrantyType(option);
+    }
+    setProductPicker(null);
+  };
+
+  // Brand / model / serial can also be typed in (Java's brand, model and serial
+  // fields are free-text). A typed value that matches a listed entry uses that
+  // entry; otherwise it is sent as a new name with id 0.
+  const handleProductPickerTyped = (text: string) => {
+    if (productPicker !== 'brand' && productPicker !== 'model' && productPicker !== 'serial') {
+      return;
+    }
+    const typed = text.trim();
+    if (!typed) {
+      return;
+    }
+    const match = productPickerOptions.find(
+      option => option.label.trim().toLowerCase() === typed.toLowerCase(),
+    );
+    handleProductPickerSelect(match ?? {id: 0, label: typed});
+  };
+
+  // Typing a customer number suggests saved customers whose number contains the digits typed.
+  const taskNumberSuggestions = useMemo(() => {
+    const digits = taskCustomerNumber.replace(/\D/g, '');
+    if (!showTaskNumberSuggestions || digits.length < 3) {
+      return [];
+    }
+    return allCustomerOptions
+      .filter(option => option.phone.replace(/\D/g, '').includes(digits))
+      .slice(0, 20);
+  }, [allCustomerOptions, taskCustomerNumber, showTaskNumberSuggestions]);
+
+  const handleTaskCustomerSelect = (customer: CustomerOption) => {
+    setShowTaskNumberSuggestions(false);
+    setTaskCustomerId(customer.id);
+    setTaskLocationId(customer.locationId ?? 0);
+    setTaskCustomerName(customer.name);
+    setTaskCustomerNumber(customer.phone);
+    if (customer.address) {
+      setTaskAddress(customer.address);
+    }
+    setTaskStateId(0);
+    if (customer.state) {
+      setTaskState(customer.state);
+    }
+    setTaskCityId(0);
+    setTaskAllCityOptions([]);
+    setTaskCitySuggestions([]);
+    if (customer.city) {
+      setTaskCity(customer.city);
+    }
+    if (customer.pinCode) {
+      setTaskPinCode(customer.pinCode);
+    }
+    if (customer.landmark) {
+      setTaskLandmark(customer.landmark);
+    }
+    if (customer.productBrand) {
+      setTaskProductBrand(customer.productBrand);
+    }
+    setTaskEmail(normalizeEmail(customer.emailId));
+    setTaskLatitude(customer.latitude || '');
+    setTaskLongitude(customer.longitude || '');
+    setTaskCustomerSuggestions([]);
+    setShowTaskCustomerSuggestions(false);
+    // Autofilled: close both customer dropdowns and drop focus from the name/number fields so
+    // nothing reopens them. Tapping either field brings its dropdown back.
+    setShowTaskNumberSuggestions(false);
+    Keyboard.dismiss();
+  };
+
+  const {openContacts, contactPickerModal} = useContactPicker(contact => {
+    setTaskCustomerNumber(contact.phone);
+    setShowTaskNumberSuggestions(false);
+    if (!taskCustomerName.trim()) {
+      setTaskCustomerName(contact.name);
+    }
+    if (!initialValues?.leadId && !initialValues?.customerId) {
+      setTaskCustomerId(0);
+      setTaskLocationId(0);
+    }
+  });
+
+  const handleContactPicked = (contact: DeviceContact) => {
+    setTaskCustomerNumber(contact.phone);
+    setShowTaskNumberSuggestions(false);
+    if (!taskCustomerName.trim()) {
+      setTaskCustomerName(contact.name);
+    }
+    if (!initialValues?.leadId && !initialValues?.customerId) {
+      setTaskCustomerId(0);
+      setTaskLocationId(0);
+    }
+  };
+
+  // Java TaskDialogNew quote spinner + getQuotationIdWiseDetails(): picking a quote names the task
+  // after it, clears the customer block and refills it from Quotation/getquotationsbyid (customer,
+  // location, grand total as the Rate amount). The task is then posted with that customer and
+  // location -- the quote id itself is not sent.
+  const handleQuoteSelect = async (option: QuoteOption) => {
+    setSelectedQuote(option);
+    setTaskTitle(option.label);
+    setTaskCustomerId(0);
+    setTaskLocationId(0);
+    setTaskCustomerName('');
+    setTaskCustomerNumber('');
+    setTaskEmail('');
+    setTaskAddress('');
+    setTaskLandmark('');
+    setTaskState('');
+    setTaskCity('');
+    setTaskPinCode('');
+    setTaskLatitude('');
+    setTaskLongitude('');
+    setAmcAmount('');
+    setTaskStateId(0);
+    setTaskCityId(0);
+    setTaskAllCityOptions([]);
+    try {
+      const response = await getQuotationdetailsByQuoteId({Id: option.id, UserId: ownerId});
+      const data = (response?.ResultData ?? {}) as Record<string, any>;
+      const customer = (data.Customer ?? {}) as Record<string, any>;
+      const location = (customer.LocationList ?? {}) as Record<string, any>;
+      setTaskCustomerName(String(customer.CustomerName ?? ''));
+      setTaskCustomerNumber(String(customer.MobileNumber ?? ''));
+      setTaskAddress(String(location.Address ?? ''));
+      setTaskLandmark(String(location.Description ?? ''));
+      setTaskState(String(location.State ?? ''));
+      setTaskCity(String(location.City ?? ''));
+      setTaskPinCode(String(location.PinCode ?? ''));
+      const total = Number(data.GrandTotalAmount) || 0;
+      if (total !== 0) {
+        setAmcAmount(total.toFixed(3));
+        setWarrantyMode('out'); // Java: Rate on, AMC off
+      }
+      // Java: customerDetailsID / locationID from the quote's customer, lat/long from its address
+      // (Java reads CountryDetailsId into customerDetailsID, which looks like a slip; the customer's
+      // own CustomerDetailsid is what the task needs.)
+      setTaskCustomerId(Number(customer.CustomerDetailsid) || 0);
+      setTaskLocationId(Number(customer.LocationId) || Number(location.Id) || 0);
+      setTaskLatitude(String(location.latitude ?? location.Latitude ?? ''));
+      setTaskLongitude(String(location.Longitude ?? location.longitude ?? ''));
+    } catch {
+      showFailureMsg(t('rn_unable_to_load_the_quote_details'));
+    }
+  };
+
+  const geocodeAddress = useCallback(async (fullAddress: string) => {
+    const query = fullAddress.trim();
+    if (!query) {
+      return null;
+    }
+    try {
+      // Google Geocoding first; OpenStreetMap only if Google is unavailable.
+      const found = await geocodeWithGoogle(query);
+      if (found) {
+        return {latitude: String(found.latitude), longitude: String(found.longitude)};
+      }
+    } catch (error) {
+      console.warn('[AddTask] Unable to geocode address', error);
+    }
+    return null;
+  }, []);
+
+  const loadTaskStateSuggestions = useCallback(
+    async (query: string) => {
+      if (allStateOptions.length > 0) {
+        setTaskStateSuggestions(filterLookupOptions(allStateOptions, query));
+        setIsStateLoading(false);
+        return;
+      }
+
+      if (isStateLoading) {
+        return;
+      }
+
+      setIsStateLoading(true);
+      try {
+        const response = await getStateList();
+        const normalized = extractArray<StateDTOResultData>(response)
+          .map(
+            item =>
+              normalizeStateOption(
+                item as unknown as Parameters<typeof normalizeStateOption>[0],
+              ),
+          )
+          .filter(option => option.id > 0 && option.name);
+        setAllStateOptions(normalized);
+        setTaskStateSuggestions(filterLookupOptions(normalized, query));
+      } catch {
+        setTaskStateSuggestions([]);
+      } finally {
+        setIsStateLoading(false);
+      }
+    },
+    [allStateOptions, isStateLoading],
+  );
+
+  const preloadTaskStates = useCallback(() => {
+    if (allStateOptions.length > 0 || isStateLoading) {
+      return;
+    }
+    loadTaskStateSuggestions(taskState);
+  }, [allStateOptions.length, isStateLoading, loadTaskStateSuggestions, taskState]);
+
+  useEffect(() => {
+    const query = taskState.trim();
+    if (!showTaskStateSuggestions || query.length < 2) {
+      setTaskStateSuggestions([]);
+      return;
+    }
+
+    if (allStateOptions.length > 0) {
+      setTaskStateSuggestions(filterLookupOptions(allStateOptions, query));
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      loadTaskStateSuggestions(query);
+    }, 300);
+
+    return () => clearTimeout(timeoutId);
+  }, [allStateOptions, loadTaskStateSuggestions, showTaskStateSuggestions, taskState]);
+
+  const loadTaskCitySuggestions = useCallback(
+    async (query: string, forStateId: number) => {
+      if (!forStateId) {
+        setTaskCitySuggestions([]);
+        return;
+      }
+
+      if (taskAllCityOptions.length > 0) {
+        setTaskCitySuggestions(filterLookupOptions(taskAllCityOptions, query));
+        setIsTaskCityLoading(false);
+        return;
+      }
+
+      if (isTaskCityLoading) {
+        return;
+      }
+
+      setIsTaskCityLoading(true);
+      try {
+        const response = await getCityList({
+        userId: ownerId,
+          stateId: forStateId,
+        });
+        const normalized = extractArray<CityDTOResultData>(response)
+          .map(
+            item =>
+              normalizeCityOption(
+                item as unknown as Parameters<typeof normalizeCityOption>[0],
+              ),
+          )
+          .filter(option => option.id > 0 && option.name);
+        setTaskAllCityOptions(normalized);
+        setTaskCitySuggestions(filterLookupOptions(normalized, query));
+      } catch {
+        setTaskCitySuggestions([]);
+      } finally {
+        setIsTaskCityLoading(false);
+      }
+    },
+    [taskAllCityOptions, isTaskCityLoading, ownerId],
+  );
+
+  const preloadTaskCities = useCallback(() => {
+    if (!taskStateId) {
+      return;
+    }
+    if (taskAllCityOptions.length > 0 || isTaskCityLoading) {
+      return;
+    }
+    loadTaskCitySuggestions(taskCity, taskStateId);
+  }, [
+    taskAllCityOptions.length,
+    taskCity,
+    isTaskCityLoading,
+    loadTaskCitySuggestions,
+    taskStateId,
+  ]);
+
+  useEffect(() => {
+    const query = taskCity.trim();
+    if (!showTaskCitySuggestions || !taskStateId || query.length < 2) {
+      setTaskCitySuggestions([]);
+      return;
+    }
+
+    if (taskAllCityOptions.length > 0) {
+      setTaskCitySuggestions(filterLookupOptions(taskAllCityOptions, query));
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      loadTaskCitySuggestions(query, taskStateId);
+    }, 300);
+
+    return () => clearTimeout(timeoutId);
+  }, [
+    taskAllCityOptions,
+    taskCity,
+    loadTaskCitySuggestions,
+    showTaskCitySuggestions,
+    taskStateId,
+  ]);
+
+  const handleTaskStateSelect = (option: StateOption) => {
+    setTaskStateId(option.id);
+    setTaskState(option.name);
+    setTaskStateSuggestions([]);
+    setShowTaskStateSuggestions(false);
+
+    setTaskCity('');
+    setTaskCityId(0);
+    setTaskAllCityOptions([]);
+    setTaskCitySuggestions([]);
+  };
+
+  const handleTaskCitySelect = (option: CityOption) => {
+    setTaskCityId(option.id);
+    setTaskCity(option.name);
+    setTaskCitySuggestions([]);
+    setShowTaskCitySuggestions(false);
+  };
+
+  const MAX_TASK_ITEM_ROWS = 10;
+
+  // The dropdown lists every item as soon as it opens (fullItemOptions); typing 1-2 characters
+  // filters that list on the device, and from 3 characters the server is searched
+  // (allItemOptions) so items beyond the first page can still be found.
+  const [fullItemOptions, setFullItemOptions] = useState<ItemOption[]>([]);
+
+  const loadItemOptions = useCallback(
+    (searchParam: string) => {
+      setIsItemSearchLoading(true);
+      getLargeItemAssignedUnassigned({ownerId, searchParam})
+        .then(response => {
+          const items = extractArray<ItemsListResultData>(response);
+          const options = items.map(normalizeItemOption)
+            .filter(option => option.name && option.availableQuantity > 0);
+          if (searchParam) {
+            setAllItemOptions(options);
+          } else {
+            setFullItemOptions(options);
+          }
+        })
+        .catch(() => {
+          if (searchParam) {
+            setAllItemOptions([]);
+          } else {
+            setFullItemOptions([]);
+          }
+        })
+        .finally(() => setIsItemSearchLoading(false));
+    },
+    [ownerId],
+  );
+
+  useEffect(() => {
+    if (!isItemSearchModalOpen) {
+      return;
+    }
+    const query = itemSearchQuery.trim();
+    if (query.length < 3) {
+      setAllItemOptions([]);
+      return;
+    }
+    const timeoutId = setTimeout(() => {
+      loadItemOptions(query);
+    }, 300);
+    return () => clearTimeout(timeoutId);
+  }, [isItemSearchModalOpen, itemSearchQuery, loadItemOptions]);
+
+  const itemSearchResults = useMemo(() => {
+    const query = itemSearchQuery.trim().toLowerCase();
+    if (query.length >= 3) {
+      return allItemOptions;
+    }
+    return query
+      ? fullItemOptions.filter(option => option.name.toLowerCase().includes(query))
+      : fullItemOptions;
+  }, [allItemOptions, fullItemOptions, itemSearchQuery]);
+
+  const openItemSearchModal = (rowId: string) => {
+    setActiveItemRowId(rowId);
+    setItemSearchQuery('');
+    setAllItemOptions([]);
+    setIsItemSearchModalOpen(true);
+    loadItemOptions('');
+  };
+
+  const handleItemOptionSelect = (option: ItemOption) => {
+    const isDuplicate = taskItemRows.some(
+      row => row.rowId !== activeItemRowId && row.itemId === option.id,
+    );
+    if (isDuplicate) {
+      showFailureMsg(t('rn_this_item_has_already_been_added'));
+      return;
+    }
+    setTaskItemRows(prev =>
+      prev.map(row =>
+        row.rowId === activeItemRowId
+          ? {
+              ...row,
+              itemId: option.id,
+              itemName: option.name,
+              availableQuantity: option.availableQuantity,
+            }
+          : row,
+      ),
+    );
+    setIsItemSearchModalOpen(false);
+    setActiveItemRowId(null);
+    setItemSearchQuery('');
+  };
+
+  const updateItemRowQuantity = (rowId: string, quantity: string) => {
+    setTaskItemRows(prev =>
+      prev.map(row => {
+        if (row.rowId !== rowId) {
+          return row;
+        }
+        if (
+          quantity !== '' &&
+          row.availableQuantity > 0 &&
+          Number(quantity) > row.availableQuantity
+        ) {
+          showFailureMsg(trf('Quantity should not be greater than available quantity ({{n}}).', { n: row.availableQuantity }));
+          return row;
+        }
+        return {...row, quantity};
+      }),
+    );
+  };
+
+  const addItemRow = () => {
+    const lastRow = taskItemRows[taskItemRows.length - 1];
+    if (lastRow && lastRow.itemName) {
+      if (!lastRow.quantity || Number(lastRow.quantity) <= 0) {
+        showFailureMsg(t('rn_item_quantity_should_not_be_zero'));
+        return;
+      }
+      if (
+        lastRow.availableQuantity > 0 &&
+        Number(lastRow.quantity) > lastRow.availableQuantity
+      ) {
+        showFailureMsg(trf('Quantity should not be greater than available quantity ({{n}}).', { n: lastRow.availableQuantity }));
+        return;
+      }
+    }
+    setTaskItemRows(prev => {
+      if (prev.length >= MAX_TASK_ITEM_ROWS) {
+        showFailureMsg(trf('You can add a maximum of {{n}} items.', { n: MAX_TASK_ITEM_ROWS }));
+        return prev;
+      }
+      return [...prev, createEmptyTaskItemRow()];
+    });
+  };
+
+  const removeItemRow = (rowId: string) => {
+    setTaskItemRows(prev => {
+      if (prev.length <= 1) {
+        return [createEmptyTaskItemRow()];
+      }
+      return prev.filter(row => row.rowId !== rowId);
+    });
+  };
+
+  const renderTaskServiceNode = useCallback(
+    (node: ServiceNode, depth: number): React.ReactNode => {
+      const isSelectable = depth >= 2; // Java: only services are tappable; categories stay headers
+
+      return (
+        <View key={node.key}>
+          {isSelectable ? (
+            <TouchableOpacity
+              style={styles.serviceLeafRow}
+              onPress={() => {
+                setSelectedTaskService(node);
+                setIsTaskServiceModalOpen(false);
+                setTaskServiceTypeSearch('');
+                // Service price fills the Rate (out of warranty) amount, like the quote fill does.
+                if (node.price !== undefined && node.price > 0) {
+                  setAmcAmount(node.price.toFixed(3));
+                  setWarrantyMode('out');
+                }
+              }}
+            >
+              <Text style={styles.serviceLeafBullet}>•</Text>
+              <Text
+                style={[
+                  styles.serviceLeafText,
+                  selectedTaskService?.id === node.id
+                    ? styles.serviceLeafTextSelected
+                    : null,
+                ]}
+              >
+                {node.label}
+              </Text>
+            </TouchableOpacity>
+          ) : (
+            <Text
+              style={
+                depth === 0
+                  ? styles.serviceHeaderText
+                  : styles.serviceSubHeaderText
+              }
+            >
+              {node.label}
+            </Text>
+          )}
+          {node.children.map(child => renderTaskServiceNode(child, depth + 1))}
+        </View>
+      );
+    },
+    [selectedTaskService],
+  );
+
+  const displayedTaskServiceTree = useMemo(
+    () => filterServiceTree(serviceTree, taskServiceTypeSearch),
+    [serviceTree, taskServiceTypeSearch],
+  );
+
+  const notifySuccessAfterClose = (message: string) => {
+    setTimeout(() => showSuccessMsg(message), 400);
+  };
+
+  const handleAddTaskSubmit = async () => {
+    if (isSubmittingTask) {
+      return;
+    }
+    // Java buttonSaveTask validation chain (TaskDialogNew), same order and messages. State/City/
+    // Pin Code/Tag are only enforced when the owner's task configuration enables them.
+    const {isStateEnable, isCityEnable, isPincodeEnable, isTaskTagEnable} =
+      getCurrentUserProfile().taskConfiguration;
+    const currentUserId = getCurrentUserId() || ownerId;
+    const hasLeadingSpace = (text: string) => /^\s/.test(text) || (text.length > 0 && !text.trim());
+    const customerNumber = taskCustomerNumber.trim();
+    const [timeH, timeM, timeS] = taskTime.split(':').map(part => parseInt(part, 10) || 0);
+    const taskMoment = new Date(`${taskDate}T00:00:00`);
+    taskMoment.setHours(timeH === 0 && timeM === 0 && timeS === 0 ? 24 : timeH, timeM, timeS);
+    // Collect every failing field so all of them can be highlighted; the toast names the first.
+    const errors: Partial<Record<TaskFieldKey, string>> = {};
+    const fail = (key: TaskFieldKey, message: string) => {
+      if (!errors[key]) errors[key] = message;
+    };
+    if (!taskTitle) fail('title', 'Please Enter Task Name');
+    else if (hasLeadingSpace(taskTitle)) fail('title', 'Space is not allowed');
+    if (taskCustomerName && hasLeadingSpace(taskCustomerName)) fail('customerName', 'Space is not allowed');
+    if (!selectedFieldworker) fail('fieldworker', 'Please Select a Fieldworker');
+    if (!taskAddress) fail('address', 'Please Enter Address');
+    if (!taskLandmark) fail('landmark', 'Please Enter Landmark');
+    else if (hasLeadingSpace(taskLandmark)) fail('landmark', 'Space is not allowed');
+    if (!taskDate) fail('date', 'Please Enter Date');
+    if (!taskTime) fail('time', 'Please Enter Time');
+    else if (taskDate && !(taskMoment.getTime() > Date.now())) fail('time', 'Please Enter Valid Date/Time');
+    if (taskSpecialInstructions && hasLeadingSpace(taskSpecialInstructions)) {
+      fail('specialInstructions', 'Space is not allowed');
+    }
+    if (!taskCustomerName) fail('customerName', 'Please Enter Customer Name');
+    if (!customerNumber) fail('customerNumber', 'Please Enter Customer Number');
+    if (isStateEnable && !taskState) fail('state', 'Please Enter State');
+    if (isCityEnable && !taskCity) fail('city', 'Please Enter City');
+    if (isPincodeEnable && !taskPinCode) fail('pinCode', 'Please Enter Pin Code');
+    if (isTaskTagEnable && !selectedAddTaskTag) fail('tag', 'Please Select Valid Tag');
+    if (taskEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(taskEmail.trim())) {
+      fail('email', 'Please enter a valid email ID');
+    }
+    // Warranty end date is the same as the start date or later (YYYY-MM-DD compares correctly).
+    if (warrantyStartDate && warrantyEndDate && warrantyEndDate < warrantyStartDate) {
+      fail('warrantyEnd', 'End date cannot be before start date');
+    }
+    if (customerNumber) {
+      if (Number(customerNumber) === 0) fail('customerNumber', 'Please Enter a Valid Number');
+      else if (isIndiaCountryDetailsId() ? !/^\d{10,12}$/.test(customerNumber) : customerNumber.length <= 6) {
+        fail('customerNumber', 'Please Enter a Valid Number');
+      }
+    }
+    if (warrantyMode === 'out') {
+      if (!amcAmount) fail('rate', 'Please Enter Rate');
+      else if (Number(amcAmount) === 0) fail('rate', 'Please Enter valid Amount');
+    }
+    const errorMessages = Object.values(errors);
+    if (errorMessages.length > 0) {
+      setFieldErrors(errors);
+      showFailureMsg(errorMessages[0] as string);
+      return;
+    }
+    setFieldErrors({});
+    const hasInvalidItemQuantity = taskItemRows.some(
+      row => row.itemName && Number(row.quantity) <= 0,
+    );
+    if (hasInvalidItemQuantity) {
+      showFailureMsg(t('rn_item_quantity_should_not_be_zero'));
+      return;
+    }
+
+    setIsSubmittingTask(true);
+
+    let resolvedLatitude = taskLatitude;
+    let resolvedLongitude = taskLongitude;
+    if (!Number(resolvedLatitude) || !Number(resolvedLongitude)) {
+      const fullAddress = [
+        taskAddress.trim(),
+        taskCity.trim(),
+        taskState.trim(),
+        taskPinCode.trim(),
+      ]
+        .filter(Boolean)
+        .join(', ');
+      const geocoded = await geocodeAddress(fullAddress);
+      if (geocoded) {
+        resolvedLatitude = geocoded.latitude;
+        resolvedLongitude = geocoded.longitude;
+        setTaskLatitude(geocoded.latitude);
+        setTaskLongitude(geocoded.longitude);
+      }
+    }
+
+    // Java: no resolved lat/long -> "Please enter address correctly".
+    if (!resolvedLatitude || !resolvedLongitude || Number(resolvedLatitude) === 0 || Number(resolvedLongitude) === 0) {
+      setIsSubmittingTask(false);
+      showFailureMsg(t('please_enter_address_correctly'));
+      return;
+    }
+
+    const multipleItemAssigned: AddTaskMultipleItemAssigned[] = taskItemRows
+      .filter(row => row.itemId > 0 && Number(row.quantity) > 0)
+      .map(row => ({
+        ItemId: row.itemId,
+        ItemIssuedId: 0,
+        ItemName: row.itemName,
+        ItemQuantity: Number(row.quantity),
+        TempTechSrNo: 0,
+        UsedItemQty: 0,
+      }));
+
+    // Java sends the recording inline as base64 (Base64AudioString) with an
+    // empty AudioFilePath; a device-local path is meaningless to the server.
+    let instructionAudioBase64 = '';
+    if (instructionAudioPath) {
+      try {
+        instructionAudioBase64 = await RNFS.readFile(instructionAudioPath, 'base64');
+      } catch {
+        setIsSubmittingTask(false);
+        showFailureMsg(t('rn_unable_to_read_the_recorded_instruction'));
+        return;
+      }
+    }
+
+    const payload: AddTaskResultData = {
+      AMCServiceDetailsId: taskAmcServiceDetailsId,
+      Address: taskAddress.trim(),
+      AudioFilePath: '',
+      Base64AudioString: instructionAudioBase64,
+      BrandName: taskProductBrand.trim(),
+      City: taskCity.trim(),
+      ContactNo: taskCustomerNumber.trim(),
+      CountryDetailsId: 0,
+      // Java: CreatedBy/UpdatedBy are the logged-in user (SharedPrefManager.getUserId()); only
+      // the lookups use the owner id.
+      CreatedBy: currentUserId,
+      CustomerDetailsid: taskCustomerId,
+      CustomerName: taskCustomerName.trim(),
+      CustomerTagId: 0,
+      Description: taskSpecialInstructions.trim(),
+      EnquiryId: 0,
+      FSRId: selectedFsr?.id || 0,
+      Id: 0,
+      IsActive: true,
+      IsModelError: true,
+      IsSuccessful: true,
+      ItemId: 0,
+      ItemQuantity: 0,
+      LeadId: initialValues?.leadId ?? 0,
+      LocDescription: taskLandmark.trim(),
+      LocIsActive: true,
+      LocName: '',
+      // existing customer -> that customer's location; new customer -> 0 (as Java)
+      LocationId: taskCustomerId ? taskLocationId : 0,
+      Longitude: resolvedLongitude,
+      ModelNumber: taskModelNumber.trim(),
+      Email: taskEmail.trim(),
+      SerialNo: taskSerialNo.trim(),
+      TaskWarrantyDetailsModelDto: {
+        BrandId: selectedBrand?.id ?? 0,
+        BrandName: selectedBrand?.label ?? taskProductBrand.trim(),
+        ModelId: selectedModel?.id ?? 0,
+        ModelName: selectedModel?.label ?? taskModelNumber.trim(),
+        SerialNoId: selectedSerial?.id ?? 0,
+        SerialNoName: selectedSerial?.label ?? taskSerialNo.trim(),
+        WarrantyTypeId: selectedWarrantyType?.id ?? 0,
+        WarrantyTypeName: selectedWarrantyType?.label ?? '',
+        StartDate: warrantyStartDate.trim(),
+        EndDate: warrantyEndDate.trim(),
+        UserId: currentUserId,
+        CreatedBy: currentUserId,
+      },
+      MultipleItemAssigned: multipleItemAssigned,
+      Name: taskTitle.trim(),
+      NewAddedTaskId: 0,
+      OnHoldTaskId: 0,
+      PaymentMode: warrantyMode === 'out' ? 'Rate' : 'AMC',
+      PaymentModeId: warrantyMode === 'out' ? 2 : 1,
+      PinCode: taskPinCode.trim(),
+      // Java's Add Task dialog never posts the quote id (addTask.setQuotationId is commented out);
+      // the quote's customer and location ids carry the link instead.
+      QuotationId: 0,
+      ServiceId: selectedTaskService?.id || 0,
+      State: taskState.trim(),
+      TaskDate: taskDate,
+      TaskStatus: 4,
+      TaskTagId: selectedAddTaskTag?.id || 0,
+      TaskType: 1,
+      Time: taskTime,
+      UpdatedBy: currentUserId,
+      UserId: selectedFieldworker?.id || currentUserId,
+      WagesPerHour: warrantyMode === 'out' ? Number(amcAmount) || 0 : 0,
+      latitude: resolvedLatitude,
+    };
+
+    const sourceTaskId = initialValues?.sourceTaskId ?? 0;
+    // Edit / re-assign keep the task's own location record (Java:
+    // setLocationId(mResultData.getLocationId())) and reset it to TaskStatus 4.
+    const existingTaskFields = {
+      Id: sourceTaskId,
+      LocationId: initialValues?.locationId || payload.LocationId,
+      TaskStatus: 4,
+    };
+
+    if (__DEV__) {
+      // development aid: the exact request body, to compare with Java when the server rejects it
+      console.log('[AddTask] payload', JSON.stringify(payload));
+    }
+    try {
+      let successMessage = '';
+      if (formMode === 'edit') {
+        ensureSuccess(
+          await updateTask({...payload, ...existingTaskFields} as unknown as Parameters<typeof updateTask>[0]),
+        );
+        successMessage = t('task_updated_successfully');
+      } else if (formMode === 'reassign') {
+        ensureSuccess(
+          await reassignTaskNew({
+            ...payload,
+            ...existingTaskFields,
+            NewTaskId: initialValues?.newTaskId ?? '',
+          } as unknown as Parameters<typeof reassignTaskNew>[0]),
+        );
+        successMessage = t('rn_task_re_assigned_successfully');
+      } else if (formMode === 'reassignCompleted') {
+        ensureSuccess(await addTask({...payload, Id: 0, OnHoldTaskId: sourceTaskId}));
+        successMessage = t('rn_task_re_assigned_successfully');
+      } else {
+        ensureSuccess(await addTask(payload));
+        successMessage = tr('Task Added Successfully');
+      }
+      onSaved?.();
+      onClose();
+      notifySuccessAfterClose(successMessage);
+    } catch (error) {
+      if (__DEV__) {
+        console.log('[AddTask] failed', (error as any)?.response?.data ?? error);
+      }
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Unable to save the task right now.';
+      showFailureMsg(message);
+    } finally {
+      setIsSubmittingTask(false);
+    }
+  };
+
+  return (
+    <>
+      <Modal
+        visible={visible}
+        animationType="slide"
+        transparent
+        onRequestClose={onClose}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalSheet}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalHeaderTitle}>{formTitle}</Text>
+              <TouchableOpacity onPress={onClose}>
+                <Ionicons name="close" style={styles.modalCloseIcon} />
+              </TouchableOpacity>
+            </View>
+
+            <KeyboardAvoidingView
+              style={styles.modalFlex}
+              behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            >
+              <ScrollView
+                contentContainerStyle={styles.modalScrollContent}
+                keyboardShouldPersistTaps="handled"
+              >
+                <View style={styles.fieldWrap}>
+                  <OutlinedInput
+                    style={[styles.pillInput, errBorder('title')]}
+                    placeholder={t('star_task_title')}
+                    placeholderTextColor={COLORS.lightGray}
+                    value={taskTitle}
+                    onChangeText={setTaskTitle}
+                    maxLength={100}
+                  />
+                </View>
+
+                {/* Java: edittext_date_picker / edittext_time are focusable=false and open pickers. */}
+                <View style={[styles.fieldRow, styles.dateRow]}>
+                  <TouchableOpacity
+                    style={styles.halfField}
+                    activeOpacity={0.7}
+                    onPress={() => openTaskPicker('date')}
+                  >
+                    <OutlinedInput
+                      style={[styles.pillInput, errBorder('date')]}
+                      placeholder={t('star_date')}
+                      placeholderTextColor={COLORS.lightGray}
+                      value={taskDate}
+                      editable={false}
+                      pointerEvents="none"
+                    />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.halfField}
+                    activeOpacity={0.7}
+                    onPress={() => openTaskPicker('time')}
+                  >
+                    <OutlinedInput
+                      style={[styles.pillInput, errBorder('time')]}
+                      placeholder={t('star_time')}
+                      placeholderTextColor={COLORS.lightGray}
+                      value={taskTime}
+                      editable={false}
+                      pointerEvents="none"
+                    />
+                  </TouchableOpacity>
+                </View>
+
+                <TouchableOpacity
+                  style={[styles.dropdownPill, styles.technicianPill, errBorder('fieldworker')]}
+                  disabled={initialValues?.lockAssignedFieldworker}
+                  onPress={() => {
+                    loadFieldworkers();
+                    setIsFieldworkerModalOpen(true);
+                  }}
+                >
+                  <Text
+                    style={
+                      selectedFieldworker
+                        ? styles.dropdownPillTextValue
+                        : styles.dropdownPillTextPlaceholder
+                    }
+                    numberOfLines={1}
+                  >
+                    {selectedFieldworker
+                      ? selectedFieldworker.name
+                      : tr('Select Fieldworkers*')}
+                  </Text>
+                  <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.dropdownPill, styles.tagPill, errBorder('tag')]}
+                  onPress={() => {
+                    loadTaskTags();
+                    setIsAddTaskTagModalOpen(true);
+                  }}
+                >
+                  <Text
+                    style={
+                      selectedAddTaskTag
+                        ? styles.dropdownPillTextValue
+                        : styles.dropdownPillTextPlaceholder
+                    }
+                    numberOfLines={1}
+                  >
+                    {selectedAddTaskTag
+                      ? selectedAddTaskTag.label
+                      : tr('Select Task Tag')}
+                  </Text>
+                  <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                </TouchableOpacity>
+
+                <View style={styles.warrantyRow}>
+                  <View style={styles.warrantyToggleGroup}>
+                    <TouchableOpacity
+                      style={[
+                        styles.warrantyToggleButton,
+                        styles.warrantyToggleButtonLeft,
+                        warrantyMode === 'in' &&
+                          styles.warrantyToggleButtonActive,
+                      ]}
+                      onPress={() => setWarrantyMode('in')}
+                    >
+                      <Text
+                        style={
+                          warrantyMode === 'in'
+                            ? styles.warrantyToggleTextActive
+                            : styles.warrantyToggleText
+                        }
+                      >
+                        {t('rn_in_warranty')}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[
+                        styles.warrantyToggleButton,
+                        styles.warrantyToggleButtonRight,
+                        warrantyMode === 'out' &&
+                          styles.warrantyToggleButtonActive,
+                      ]}
+                      onPress={() => setWarrantyMode('out')}
+                    >
+                      <Text
+                        style={
+                          warrantyMode === 'out'
+                            ? styles.warrantyToggleTextActive
+                            : styles.warrantyToggleText
+                        }
+                      >
+                        {t('rn_out_of_warranty')}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                  <View style={styles.amcDisabledField}>
+                    <DecimalInput
+                      maxTotalDigits={10}
+                      maxIntDigits={10}
+                      style={[
+                        styles.amcDisabledInput,
+                          warrantyMode === 'out' ? styles.amcEnabledInput : null,
+                        errBorder('rate'),
+                      ]}
+                      value={warrantyMode === 'out' ? amcAmount : ''}
+                      onChangeText={text =>
+                        setAmcAmount(sanitizeDecimalInput(text))
+                      }
+                      editable={warrantyMode === 'out'}
+                      // in warranty the field is disabled and the overlay below explains why; when
+                      // it can be filled the 0.000 placeholder shows
+                      placeholder={warrantyMode === 'out' ? undefined : ''}
+                    />
+                    {/* TextInput's native placeholder just clips long text with no
+                        ellipsis -- overlay a Text with ellipsizeMode instead. */}
+                    {warrantyMode !== 'out' ? (
+                      <Text
+                        style={styles.amcPlaceholderOverlay}
+                        numberOfLines={1}
+                        ellipsizeMode="tail"
+                        pointerEvents="none"
+                      >
+                        {t('not_applicable_in_amc_mode')}
+                      </Text>
+                    ) : null}
+                  </View>
+                </View>
+
+                {/* Warranty type + dates sit right under the wages row, before
+                    the address block -- same order as dialog_add_task_new.xml
+                    (spinWarranty, taskWarrantyStartDate/EndDate). */}
+                <TouchableOpacity
+                  style={[styles.dropdownPill, styles.warrantyTypePill]}
+                  onPress={() => openProductPicker('warranty')}
+                >
+                  <Text
+                    style={
+                      selectedWarrantyType?.label
+                        ? styles.dropdownPillTextValue
+                        : styles.dropdownPillTextPlaceholder
+                    }
+                    numberOfLines={1}
+                  >
+                    {selectedWarrantyType?.label || 'Select'}
+                  </Text>
+                  <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                </TouchableOpacity>
+
+                <View style={[styles.fieldRow, styles.warrantyDatesRow]}>
+                  <TouchableOpacity
+                    style={styles.halfField}
+                    activeOpacity={0.7}
+                    onPress={() => openTaskPicker('start')}
+                  >
+                    <OutlinedInput
+                      style={styles.pillInput}
+                      placeholder={t('task_start_date')}
+                      placeholderTextColor={COLORS.lightGray}
+                      value={warrantyStartDate}
+                      editable={false}
+                      pointerEvents="none"
+                    />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.halfField}
+                    activeOpacity={0.7}
+                    onPress={() => openTaskPicker('end')}
+                  >
+                    <OutlinedInput
+                      style={styles.pillInput}
+                      placeholder={t('task_end_date')}
+                      placeholderTextColor={COLORS.lightGray}
+                      value={warrantyEndDate}
+                      editable={false}
+                      pointerEvents="none"
+                    />
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.fieldWrap}>
+                  {/* Java: tapping the address opens the full-screen Google Places search. */}
+                  <Pressable onPress={() => setIsPlaceSearchOpen(true)}>
+                    <View pointerEvents="none">
+                      <OutlinedInput
+                        style={[styles.pillInput, errBorder('address')]}
+                        placeholder={t('star_customer_address')}
+                        placeholderTextColor={COLORS.lightGray}
+                        value={taskAddress}
+                        editable={false}
+                      />
+                    </View>
+                  </Pressable>
+                </View>
+
+                <View style={[styles.fieldRow, styles.stateCityFieldRow]}>
+                  <View style={[styles.halfField, styles.stateFieldWrap]}>
+                    <OutlinedInput
+                      style={[styles.pillInput, errBorder('state')]}
+                      placeholder={t('state')}
+                      placeholderTextColor={COLORS.lightGray}
+                      value={taskState}
+                      onChangeText={text => {
+                        setTaskState(text);
+                        setTaskStateId(0);
+                        setShowTaskStateSuggestions(true);
+                      }}
+                      onFocus={() => {
+                        setShowTaskStateSuggestions(true);
+                        preloadTaskStates();
+                      }}
+                    />
+                    {showTaskStateSuggestions &&
+                    taskState.trim().length >= 2 &&
+                    (isStateLoading || taskStateSuggestions.length > 0) ? (
+                      <View style={styles.suggestionBox}>
+                        {isStateLoading ? (
+                          <ActivityIndicator
+                            color={THEME_PRIMARY}
+                            size="small"
+                            style={styles.suggestionLoader}
+                          />
+                        ) : (
+                          <ScrollView
+                            style={styles.suggestionScroll}
+                            nestedScrollEnabled
+                            keyboardShouldPersistTaps="handled"
+                          >
+                            {taskStateSuggestions.map(option => (
+                              <TouchableOpacity
+                                key={option.id}
+                                style={styles.suggestionItem}
+                                onPress={() => handleTaskStateSelect(option)}
+                              >
+                                <Text
+                                  numberOfLines={1}
+                                  style={styles.suggestionItemText}
+                                >
+                                  {option.name}
+                                </Text>
+                              </TouchableOpacity>
+                            ))}
+                          </ScrollView>
+                        )}
+                      </View>
+                    ) : null}
+                  </View>
+                  <View style={[styles.halfField, styles.cityFieldWrap]}>
+                    <OutlinedInput
+                      style={[styles.pillInput, errBorder('city')]}
+                      placeholder={t('cityy')}
+                      placeholderTextColor={COLORS.lightGray}
+                      value={taskCity}
+                      onChangeText={text => {
+                        setTaskCity(text);
+                        setTaskCityId(0);
+                        setShowTaskCitySuggestions(true);
+                      }}
+                      onFocus={() => {
+                        if (!taskStateId) {
+                          showFailureMsg(t('rn_please_select_a_state_first'));
+                          return;
+                        }
+                        setShowTaskCitySuggestions(true);
+                        preloadTaskCities();
+                      }}
+                    />
+                    {showTaskCitySuggestions &&
+                    taskCity.trim().length >= 2 &&
+                    (isTaskCityLoading || taskCitySuggestions.length > 0) ? (
+                      <View style={styles.suggestionBox}>
+                        {isTaskCityLoading ? (
+                          <ActivityIndicator
+                            color={THEME_PRIMARY}
+                            size="small"
+                            style={styles.suggestionLoader}
+                          />
+                        ) : (
+                          <ScrollView
+                            style={styles.suggestionScroll}
+                            nestedScrollEnabled
+                            keyboardShouldPersistTaps="handled"
+                          >
+                            {taskCitySuggestions.map(option => (
+                              <TouchableOpacity
+                                key={option.id}
+                                style={styles.suggestionItem}
+                                onPress={() => handleTaskCitySelect(option)}
+                              >
+                                <Text
+                                  numberOfLines={1}
+                                  style={styles.suggestionItemText}
+                                >
+                                  {option.name}
+                                </Text>
+                              </TouchableOpacity>
+                            ))}
+                          </ScrollView>
+                        )}
+                      </View>
+                    ) : null}
+                  </View>
+                </View>
+
+                {/* Java: Pin Code takes the left half; the right half is an invisible spacer. */}
+                <View style={styles.fieldRow}>
+                  <View style={styles.halfField}>
+                    <OutlinedInput
+                      style={[styles.pillInput, errBorder('pinCode')]}
+                      placeholder="Pin/Post Code *"
+                      placeholderTextColor={COLORS.lightGray}
+                      value={taskPinCode}
+                      onChangeText={text =>
+                        setTaskPinCode(text.replace(/[^A-Za-z0-9]/g, '').slice(0, 12))
+                      }
+                      keyboardType="default"
+                      autoCapitalize="characters"
+                      maxLength={12}
+                    />
+                  </View>
+                  <View style={styles.halfField} />
+                </View>
+
+                <View style={styles.fieldWrap}>
+                  <OutlinedInput
+                    style={[styles.pillInput, errBorder('landmark')]}
+                    placeholder={t('star_landmark')}
+                    placeholderTextColor={COLORS.lightGray}
+                    value={taskLandmark}
+                    onChangeText={setTaskLandmark}
+                  />
+                </View>
+
+                <View style={styles.productRow}>
+                  <View style={styles.pillFieldHalf}>
+                    <TouchableOpacity
+                      style={[styles.dropdownPill, styles.productPill]}
+                      onPress={() => openProductPicker('brand')}
+                    >
+                      <Text
+                        style={
+                          taskProductBrand
+                            ? styles.dropdownPillTextValue
+                            : styles.dropdownPillTextPlaceholder
+                        }
+                        numberOfLines={1}
+                      >
+                        {taskProductBrand || 'Brand Name'}
+                      </Text>
+                      <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                    </TouchableOpacity>
+                  </View>
+                  <View style={styles.pillFieldHalf}>
+                    <TouchableOpacity
+                      style={[styles.dropdownPill, styles.productPill]}
+                      onPress={() => openProductPicker('model')}
+                    >
+                      <Text
+                        style={
+                          taskModelNumber
+                            ? styles.dropdownPillTextValue
+                            : styles.dropdownPillTextPlaceholder
+                        }
+                        numberOfLines={1}
+                      >
+                        {taskModelNumber || 'Model No'}
+                      </Text>
+                      <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                <View style={[styles.productRow, styles.productSerialRow]}>
+                  <View style={styles.pillFieldHalf}>
+                    <TouchableOpacity
+                      style={[styles.dropdownPill, styles.productPill]}
+                      onPress={() => openProductPicker('serial')}
+                    >
+                      <Text
+                        style={
+                          taskSerialNo
+                            ? styles.dropdownPillTextValue
+                            : styles.dropdownPillTextPlaceholder
+                        }
+                        numberOfLines={1}
+                      >
+                        {taskSerialNo || 'Serial No'}
+                      </Text>
+                      <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                    </TouchableOpacity>
+                  </View>
+                  <View style={styles.pillFieldHalf} />
+                </View>
+
+                <View style={styles.taskFormTabsRow}>
+                  {TASK_FORM_TABS.map((tab, tabIndex) => (
+                    <TouchableOpacity
+                      key={tab.key}
+                      style={[
+                        styles.taskFormTabButton,
+                        tabIndex > 0 ? styles.taskFormTabDivider : null,
+                        activeTaskFormTab === tab.key
+                          ? styles.taskFormTabButtonActive
+                          : null,
+                      ]}
+                      onPress={() => setActiveTaskFormTab(tab.key)}
+                    >
+                      <Text
+                        style={
+                          activeTaskFormTab === tab.key
+                            ? styles.taskFormTabTextActive
+                            : styles.taskFormTabText
+                        }
+                      >
+                        {tab.label}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {activeTaskFormTab === 'cust' ? (
+                  <>
+                    <View
+                      style={[styles.customerNameWrap, styles.customerFieldWrap]}
+                      onTouchStart={() => {
+                        // A deliberate tap opens the name dropdown.
+                        setShowTaskCustomerSuggestions(true);
+                        setShowTaskNumberSuggestions(false);
+                      }}
+                    >
+                      <TextInput
+                        style={[styles.pillInput, styles.pillInputMuted, errBorder('customerName')]}
+                        placeholder={t('star_customer_name')}
+                        placeholderTextColor={COLORS.lightGray}
+                        editable={!initialValues?.leadId}
+                        value={taskCustomerName}
+                        onChangeText={text => {
+                          setTaskCustomerName(text);
+                          setShowTaskCustomerSuggestions(true);
+                          setShowTaskNumberSuggestions(false);
+                          if (!initialValues?.leadId && !initialValues?.customerId) {
+                            setTaskCustomerId(0);
+                            setTaskLocationId(0);
+                          }
+                        }}
+                        onFocus={() => {
+                          // Focus alone must not open the dropdown: selecting a customer moves
+                          // focus to the next field, which would otherwise reopen this list.
+                          setShowTaskNumberSuggestions(false);
+                        }}
+                      />
+                      {showTaskCustomerSuggestions &&
+                      taskCustomerSuggestions.length > 0 ? (
+                        <View style={styles.suggestionBox}>
+                          {isCustomerLoading ? (
+                            <ActivityIndicator
+                              color={THEME_PRIMARY}
+                              size="small"
+                              style={styles.suggestionLoader}
+                            />
+                          ) : null}
+                          <ScrollView
+                            style={styles.suggestionScroll}
+                            nestedScrollEnabled
+                            keyboardShouldPersistTaps="handled"
+                          >
+                            {taskCustomerSuggestions.map(option => (
+                              <TouchableOpacity
+                                key={option.id}
+                                style={styles.suggestionItem}
+                                onPress={() => handleTaskCustomerSelect(option)}
+                              >
+                                <Text style={styles.suggestionItemText}>
+                                  {option.name}
+                                </Text>
+                                {option.phone ? (
+                                  <Text style={styles.suggestionItemSubText}>
+                                    {option.phone}
+                                  </Text>
+                                ) : null}
+                              </TouchableOpacity>
+                            ))}
+                          </ScrollView>
+                        </View>
+                      ) : null}
+                    </View>
+
+                    <View style={[styles.fieldWrap, {zIndex: 25, elevation: 25}]}>
+                      <View
+                        onTouchStart={() => {
+                          // A deliberate tap opens the number dropdown.
+                          setShowTaskNumberSuggestions(true);
+                          setShowTaskCustomerSuggestions(false);
+                          ensureCustomerList();
+                        }}
+                      >
+                        <OutlinedInput
+                          style={[styles.pillInput, styles.pillInputMuted, {paddingRight: ms(52)}, errBorder('customerNumber')]}
+                          placeholder={t('star_customer_number')}
+                          placeholderTextColor={COLORS.lightGray}
+                          value={taskCustomerNumber}
+                          onChangeText={text => {
+                            setTaskCustomerNumber(text);
+                            setShowTaskNumberSuggestions(true);
+                            setShowTaskCustomerSuggestions(false);
+                            if (!initialValues?.leadId && !initialValues?.customerId) {
+                              setTaskCustomerId(0);
+                              setTaskLocationId(0);
+                            }
+                            // the customer list is fetched lazily; start it as soon as digits are typed
+                            if (text.replace(/\D/g, '').length >= 1) {
+                              ensureCustomerList();
+                            }
+                          }}
+                          onFocus={() => {
+                            // Focus alone must not open the dropdown (see name field).
+                            setShowTaskCustomerSuggestions(false);
+                            ensureCustomerList();
+                          }}
+                          keyboardType="number-pad"
+                          inputAccessoryViewID={numpadAccessoryId("number-pad")}
+                          maxLength={12}
+                          editable={!initialValues?.leadId}
+                        />
+                        <ContactBookButton onPress={openContacts} style={styles.phonebookButton} />
+                      </View>
+                      {taskNumberSuggestions.length > 0 ? (
+                        <View style={styles.suggestionBox}>
+                          <ScrollView
+                            style={styles.suggestionScroll}
+                            nestedScrollEnabled
+                            keyboardShouldPersistTaps="handled"
+                          >
+                            {taskNumberSuggestions.map(option => (
+                              <TouchableOpacity
+                                key={`${option.id}-${option.phone}`}
+                                style={styles.suggestionItem}
+                                onPress={() => handleTaskCustomerSelect(option)}
+                              >
+                                <Text style={styles.suggestionItemText}>{option.phone}</Text>
+                                <Text style={styles.suggestionItemSubText}>{option.name}</Text>
+                              </TouchableOpacity>
+                            ))}
+                          </ScrollView>
+                        </View>
+                      ) : null}
+                    </View>
+
+                    <View style={styles.fieldWrap}>
+                      <OutlinedInput
+                        style={[styles.pillInput, errBorder('email')]}
+                        placeholder={t('email_id')}
+                        placeholderTextColor={COLORS.lightGray}
+                        value={taskEmail}
+                        onChangeText={setTaskEmail}
+                        keyboardType="email-address"
+                        autoCapitalize="none"
+                      />
+                    </View>
+                  </>
+                ) : activeTaskFormTab === 'service' ? (
+                  <TouchableOpacity
+                    style={styles.dropdownPill}
+                    onPress={() => {
+                      loadServiceTypes();
+                      setIsTaskServiceModalOpen(true);
+                    }}
+                  >
+                    <Text
+                      style={
+                        selectedTaskService
+                          ? styles.dropdownPillTextValue
+                          : styles.dropdownPillTextPlaceholder
+                      }
+                      numberOfLines={1}
+                    >
+                      {selectedTaskService
+                        ? selectedTaskService.label
+                        : tr('Select Service')}
+                    </Text>
+                    <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                  </TouchableOpacity>
+                ) : activeTaskFormTab === 'quote' ? (
+                  <TouchableOpacity
+                    style={styles.dropdownPill}
+                    onPress={() => {
+                      loadQuoteList();
+                      setIsQuoteModalOpen(true);
+                    }}
+                  >
+                    <Text
+                      style={
+                        selectedQuote
+                          ? styles.dropdownPillTextValue
+                          : styles.dropdownPillTextPlaceholder
+                      }
+                      numberOfLines={1}
+                    >
+                      {selectedQuote ? selectedQuote.label : tr('Select Quote')}
+                    </Text>
+                    <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                  </TouchableOpacity>
+                ) : activeTaskFormTab === 'fsr' ? (
+                  <TouchableOpacity
+                    style={styles.dropdownPill}
+                    onPress={() => {
+                      loadFsrList();
+                      setIsFsrModalOpen(true);
+                    }}
+                  >
+                    <Text
+                      style={
+                        selectedFsr
+                          ? styles.dropdownPillTextValue
+                          : styles.dropdownPillTextPlaceholder
+                      }
+                      numberOfLines={1}
+                    >
+                      {selectedFsr ? selectedFsr.label : tr('Select FSR')}
+                    </Text>
+                    <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                  </TouchableOpacity>
+                ) : activeTaskFormTab === 'items' ? (
+                  <View>
+                    {taskItemRows.map((row, index) => (
+                      <View key={row.rowId} style={styles.itemRowCard}>
+                        <View style={styles.itemRowHeader}>
+                          <Text style={styles.itemRowTitle}>
+                            {t('item') + ' #'}{index + 1}
+                          </Text>
+                          <TouchableOpacity
+                            onPress={() => removeItemRow(row.rowId)}
+                          >
+                            <Text style={styles.itemRowRemove}>✕</Text>
+                          </TouchableOpacity>
+                        </View>
+                        <View style={styles.itemRowFieldsRow}>
+                          <TouchableOpacity
+                            style={[styles.dropdownPill, styles.itemNameDropdown]}
+                            onPress={() => openItemSearchModal(row.rowId)}
+                          >
+                            <Text
+                              style={
+                                row.itemName
+                                  ? styles.dropdownPillTextValue
+                                  : styles.dropdownPillTextPlaceholder
+                              }
+                              numberOfLines={1}
+                            >
+                              {row.itemName || 'Item Name'}
+                            </Text>
+                            <Ionicons name="chevron-down" style={styles.dropdownChevron} />
+                          </TouchableOpacity>
+                          <View style={styles.itemAvailableQtyBox}>
+                            <Text style={styles.itemAvailableQtyText}>
+                              {row.itemId > 0 ? row.availableQuantity : ''}
+                            </Text>
+                          </View>
+                          <DecimalInput integer
+                            style={[styles.pillInput, styles.itemQuantityInput]}
+                            label={t('item_quantity')}
+                            placeholderTextColor="#9aa0a6"
+                            value={row.quantity}
+                            onChangeText={text =>
+                              updateItemRowQuantity(
+                                row.rowId,
+                                text,
+                              )
+                            }
+                          />
+                        </View>
+                      </View>
+                    ))}
+                    {taskItemRows.length < MAX_TASK_ITEM_ROWS ? (
+                      <TouchableOpacity onPress={addItemRow}>
+                        <Text style={styles.addMoreText}>{t('add_more')}</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
+                ) : activeTaskFormTab === 'inst' ? (
+                  <>
+                    <View style={styles.instructionRecorderBox}>
+                      <Text style={styles.instructionRecorderLabel}>
+                        {t('rn_record_your_instructions_limit_up_to_30_se')}
+                      </Text>
+                      <View style={styles.instructionRecorderButtonsRow}>
+                        <TouchableOpacity
+                          style={[
+                            styles.instructionRecorderButton,
+                            !instructionAudioPath ||
+                            isRecordingInstruction ||
+                            isPlayingInstruction
+                              ? styles.instructionRecorderButtonDisabled
+                              : null,
+                          ]}
+                          onPress={playInstructionRecording}
+                        >
+                          <Text style={styles.instructionRecorderButtonIcon}>
+                            <Ionicons name="play-outline" size={24} />
+                          </Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={[
+                            styles.instructionRecorderButton,
+                            styles.instructionRecorderMicButton,
+                            isRecordingInstruction || isPlayingInstruction
+                              ? styles.instructionRecorderButtonDisabled
+                              : null,
+                          ]}
+                          disabled={isRecordingInstruction || isPlayingInstruction}
+                          onPress={startInstructionRecording}
+                        >
+                          <Text style={styles.instructionRecorderButtonIcon}>
+                            <Ionicons name="mic-outline" size={24} />
+                          </Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={[
+                            styles.instructionRecorderButton,
+                            !isRecordingInstruction
+                              ? styles.instructionRecorderButtonDisabled
+                              : null,
+                          ]}
+                          disabled={!isRecordingInstruction}
+                          onPress={stopInstructionRecording}
+                        >
+                          <Text style={styles.instructionRecorderButtonIcon}>
+                            <Ionicons name="stop-outline" size={24} />
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+                      <Text style={styles.instructionRecorderTimerText}>
+                        {instructionTimerLabel}
+                      </Text>
+                    </View>
+
+                    <View style={styles.fieldWrap}>
+                      <TextInput
+                        style={styles.instructionsInput}
+                        placeholder={t('special_instructions')}
+                        placeholderTextColor="#9aa0a6"
+                        value={taskSpecialInstructions}
+                        onChangeText={text =>
+                          setTaskSpecialInstructions(text.slice(0, MAX_INSTRUCTION_CHARS))
+                        }
+                        multiline
+                        textAlignVertical="top"
+                        maxLength={MAX_INSTRUCTION_CHARS}
+                      />
+                      <Text style={styles.instructionsCharCount}>
+                        {taskSpecialInstructions.length}/{MAX_INSTRUCTION_CHARS}
+                      </Text>
+                    </View>
+                  </>
+                ) : (
+                  <View style={styles.tabContentPlaceholder}>
+                    <Text style={styles.tabContentPlaceholderText}>
+                      {t('rn_no_data_available')}
+                    </Text>
+                  </View>
+                )}
+
+                <TouchableOpacity
+                  style={styles.darkAddButton}
+                  onPress={handleAddTaskSubmit}
+                  disabled={isSubmittingTask}
+                >
+                  {isSubmittingTask ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <>
+                      <View style={styles.addButtonIconWrap}>
+                        <InvoiceIcon size={ms(30)} color="#FFFFFF" />
+                      </View>
+                      <Text style={styles.darkAddButtonText}>{submitLabel}</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+
+                <TouchableOpacity onPress={onClose} disabled={isSubmittingTask}>
+                  <Text style={styles.cancelText}>{t('cancel')}</Text>
+                </TouchableOpacity>
+              </ScrollView>
+            </KeyboardAvoidingView>
+          </View>
+        </View>
+        {contactPickerModal}
+      </Modal>
+
+      <PlaceSearchModal
+        visible={isPlaceSearchOpen}
+        onClose={() => setIsPlaceSearchOpen(false)}
+        onSelect={place => {
+          setTaskAddress(place.address);
+          setTaskLatitude(String(place.latitude));
+          setTaskLongitude(String(place.longitude));
+          setIsPlaceSearchOpen(false);
+        }}
+      />
+
+      {/* iOS: the inline picker is shown in its own sheet, drawn inside the open task modal
+          (AppModal stacks it there), so it is not hidden behind the modal. Confirm / Cancel
+          apply the value, because the inline wheel fires onValueChange on every scroll. */}
+      {Platform.OS === 'ios' ? (
+        <Modal
+          transparent
+          animationType="fade"
+          visible={taskPicker !== null}
+          onRequestClose={() => setTaskPicker(null)}>
+          <Pressable style={taskStyles.dateBackdrop} onPress={() => setTaskPicker(null)}>
+            <Pressable style={taskStyles.dateSheet} onPress={e => e.stopPropagation()}>
+              <Text style={taskStyles.dateSheetTitle}>
+                {taskPicker === 'time' ? tr('Select Time') : t('rn_select_date')}
+              </Text>
+              {taskPicker ? (
+                <DateTimePicker
+                  value={taskPickerValue}
+                  mode={taskPicker === 'time' ? 'time' : 'date'}
+                  display="inline"
+                  themeVariant="light"
+                  accentColor={COLORS.primary}
+                  minimumDate={
+                    taskPicker === 'time'
+                      ? undefined
+                      : taskPicker === 'end' && warrantyStartDate
+                        ? new Date(`${warrantyStartDate}T00:00:00`)
+                        : new Date(Date.now() - 1000)
+                  }
+                  onValueChange={(_: DateTimePickerChangeEvent, picked: Date) => setTaskPickerValue(picked)}
+                />
+              ) : null}
+              <View style={taskStyles.dateSheetActions}>
+                <TouchableOpacity style={taskStyles.dateCancelBtn} onPress={() => setTaskPicker(null)}>
+                  <Text style={taskStyles.dateCancelText}>{tr('CANCEL')}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={taskStyles.dateConfirmBtn}
+                  onPress={() => {
+                    if (taskPicker) applyTaskPicker(taskPicker, taskPickerValue);
+                    setTaskPicker(null);
+                  }}>
+                  <Text style={taskStyles.dateConfirmText}>{t('qr_code_positive_button_confirm')}</Text>
+                </TouchableOpacity>
+              </View>
+            </Pressable>
+          </Pressable>
+        </Modal>
+      ) : taskPicker ? (
+        <DateTimePicker
+          value={taskPickerValue}
+          mode={taskPicker === 'time' ? 'time' : 'date'}
+          is24Hour={false}
+          display="default"
+          minimumDate={
+            taskPicker === 'time'
+              ? undefined
+              : taskPicker === 'end' && warrantyStartDate
+                ? new Date(`${warrantyStartDate}T00:00:00`)
+                : new Date(Date.now() - 1000)
+          }
+          onValueChange={(_: DateTimePickerChangeEvent, picked: Date) => {
+            applyTaskPicker(taskPicker, picked);
+            setTaskPicker(null);
+          }}
+          onDismiss={() => setTaskPicker(null)}
+          positiveButton={{label: t('qr_code_positive_button_know'), textColor: COLORS.primary}}
+          negativeButton={{label: tr('CANCEL'), textColor: COLORS.primary}}
+        />
+      ) : null}
+
+      {/* Java TaskDialogNew: dialog_searchable_spinner_technician -- the shared dialog. */}
+      <SearchPickerModal
+        visible={isFieldworkerModalOpen}
+        title={t('select_technicians')}
+        options={allFieldworkers.map(item => ({
+          id: getFieldworkerId(item),
+          label: getFieldworkerName(item),
+        }))}
+        loading={isFieldworkerLoading}
+        emptyText="No fieldworkers found."
+        onSelect={picked => {
+          const item = allFieldworkers.find(i => getFieldworkerId(i) === picked.id);
+          if (item) {
+            handleFieldworkerSelect(item);
+          }
+        }}
+        onClose={() => setIsFieldworkerModalOpen(false)}
+      />
+
+      <SearchPickerModal
+        visible={productPicker !== null}
+        title={
+          productPicker === 'brand'
+            ? tr('Select Brand')
+            : productPicker === 'model'
+            ? 'Select Model'
+            : productPicker === 'serial'
+            ? 'Select Serial No'
+            : 'Select Warranty Type'
+        }
+        options={productPickerOptions}
+        loading={isProductPickerLoading}
+        emptyText="No results found."
+        onSelect={handleProductPickerSelect}
+        onClose={() => setProductPicker(null)}
+        showOk={productPicker === 'brand' || productPicker === 'model' || productPicker === 'serial'}
+        onDismissText={handleProductPickerTyped}
+        onSearch={
+          productPicker && productPicker !== 'warranty'
+            ? text => loadProductPickerOptions(productPicker, text)
+            : undefined
+        }
+      />
+
+      <SearchPickerModal
+        visible={isAddTaskTagModalOpen}
+        title={t('select_task_tag')}
+        options={taskTags}
+        loading={isTaskTagLoading}
+        emptyText="No task tags found."
+        onSelect={picked => {
+          const tag = taskTags.find(t => t.id === picked.id);
+          if (tag) {
+            setSelectedAddTaskTag(tag);
+          }
+          setIsAddTaskTagModalOpen(false);
+        }}
+        onClose={() => setIsAddTaskTagModalOpen(false)}
+      />
+
+      <SearchPickerModal
+        visible={isItemSearchModalOpen}
+        title={t('select_item')}
+        options={itemSearchResults.map(option => ({id: option.id, label: option.name}))}
+        loading={isItemSearchLoading}
+        searchHint="Search Item"
+        emptyText="No items found."
+        onSearch={setItemSearchQuery}
+        onSelect={picked => {
+          const option = itemSearchResults.find(o => o.id === picked.id);
+          if (option) {
+            handleItemOptionSelect(option);
+          }
+        }}
+        onClose={() => setIsItemSearchModalOpen(false)}
+      />
+
+      <Modal
+        visible={isTaskServiceModalOpen}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setIsTaskServiceModalOpen(false)}
+      >
+        <Pressable
+          style={styles.centeredModalOverlay}
+          onPress={() => setIsTaskServiceModalOpen(false)}
+        >
+          <Pressable style={styles.serviceModalBox} onPress={() => {}}>
+            <View style={styles.serviceSearchWrap}>
+              <TextInput
+                style={styles.serviceSearchInput}
+                placeholder={t('rn_search_2')}
+                placeholderTextColor="#757575"
+                value={taskServiceTypeSearch}
+                onChangeText={setTaskServiceTypeSearch}
+              />
+              <Ionicons name="search-outline" size={ms(26)} color="#8a8f98" />
+            </View>
+            {isServiceTypeLoading ? (
+              <ActivityIndicator
+                color={THEME_PRIMARY}
+                size="small"
+                style={styles.suggestionLoader}
+              />
+            ) : (
+              <ScrollView keyboardShouldPersistTaps="handled" style={styles.serviceModalScroll}>
+                {displayedTaskServiceTree.map(node =>
+                  renderTaskServiceNode(node, 0),
+                )}
+                {displayedTaskServiceTree.length === 0 ? (
+                  <Text style={styles.emptyText}>
+                    {serviceTypeError || 'No service types found.'}
+                  </Text>
+                ) : null}
+              </ScrollView>
+            )}
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      <SearchPickerModal
+        visible={isQuoteModalOpen}
+        title={t('rn_select_quote')}
+        options={quoteList}
+        loading={isQuoteLoading}
+        emptyText={quoteError || 'No quotes found.'}
+        onSelect={picked => {
+          const option = quoteList.find(o => o.id === picked.id);
+          if (option) {
+            handleQuoteSelect(option);
+          }
+          setIsQuoteModalOpen(false);
+        }}
+        onClose={() => setIsQuoteModalOpen(false)}
+      />
+
+      <SearchPickerModal
+        visible={isFsrModalOpen}
+        title={t('rn_select_fsr')}
+        options={fsrList}
+        loading={isFsrLoading}
+        emptyText={fsrError || 'No FSR found.'}
+        onSelect={picked => {
+          const option = fsrList.find(o => o.id === picked.id);
+          if (option) {
+            setSelectedFsr(option);
+          }
+          setIsFsrModalOpen(false);
+        }}
+        onClose={() => setIsFsrModalOpen(false)}
+      />
+    </>
+  );
+};
+
+export default AddTaskModal;

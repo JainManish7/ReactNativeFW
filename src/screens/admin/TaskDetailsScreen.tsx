@@ -1,0 +1,1242 @@
+// src/screens/admin/TaskDetailsScreen.tsx
+
+import React, {useEffect, useRef, useState} from 'react';
+import {
+  ActivityIndicator,
+  Animated,
+  Easing,
+  Image,
+  Linking,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import {getTaskById} from '../../api/task/taskService';
+import type {
+  TasksList,
+  TasksListResultData,
+  TasksListMultipleItemAssigned,
+} from '../../api/task/task.types';
+import type {TaskListItem} from './adminLegacyApiTypes';
+import {getStringField, getNumberField} from './crmShared';
+import {ms, sp} from '../../utils/responsive';
+import MapView, {Marker, PROVIDER_GOOGLE} from 'react-native-maps';
+import {FieldWebLocationPin} from '../../components/MapMarkers';
+import {FIELDWEB_MAP_STYLE} from '../../config/mapStyle';
+import {formatAmount} from '../../utils/decimal';
+import BackBar from '../../components/BackBar';
+import {HEADER_CONTENT_HEIGHT} from '../../components/AppHeader';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import {COLORS} from '../../theme/theme';
+import {downloadReport} from '../../api/report/reportService';
+import {getInvoicedetailsByInvoiceId} from '../../api/accountManagement/accountManagementService';
+import {geocodeAddress} from '../../utils/googleMaps';
+import AddTaskModal, {buildTaskFormValues, type AddTaskInitialValues} from './AddTaskModal';
+import TaskClosureSection, {type TaskClosureSectionHandle} from './TaskClosureSection';
+import OwnerTaskTrackingMap from './OwnerTaskTrackingMap';
+import {getCurrentCountryCode, getCurrentCurrencySymbol} from '../../state/session';
+import {getTaskClosureDetails} from '../../api/taskList/taskListService';
+import {showFailureMsg} from '../../utils/toast';
+import {usePdfDownload} from '../../hooks/usePdfDownload';
+import {useTranslation} from 'react-i18next';
+import {tr} from '../../i18n/tr';
+import { toUserMessage } from '../../utils/userErrorMessage';
+
+type TaskDetailsTask = TasksListResultData | TaskListItem;
+
+type TaskDetailsScreenProps = {
+  ownerId: number;
+  taskId: number;
+  fallbackTask?: TaskDetailsTask | null;
+  customerName?: string;
+  customerPhone?: string;
+  customerAddress?: string;
+  onBack: () => void;
+  /** Stack-pushed use gets the native header (with back) instead. */
+  hideBackBar?: boolean;
+  /** Embedded under the shared AppHeader without host padding. */
+  underAppHeader?: boolean;
+  /**
+   * Which Java screen this mirrors. 'crm' (default): CRMTaskDetailsFragmentNew
+   * (dialog_crm_task_details), opened from customer details. 'taskList': the
+   * owner task list, where MainTaskFragmentNew opens TaskDetailsFragmentNew
+   * (dialog_task_details) for Completed / Rejected tasks.
+   */
+  source?: 'crm' | 'taskList';
+  /**
+   * Java's CRM details sit on the red root as a white 30dp-radius sheet with the 80dp default
+   * profile image on top (dialog_crm_task_details.xml). Used from Item Inventory > Used details.
+   */
+  sheetStyle?: boolean;
+};
+
+const THEME_PRIMARY = '#c3002f';
+
+const getString = (
+  item: Record<string, unknown>,
+  camelKey: string,
+  pascalKey: string,
+) => {
+  const value = item[camelKey] ?? item[pascalKey];
+  return typeof value === 'string' ? value.trim() : '';
+};
+
+const getNewTaskId = (item: TaskDetailsTask) =>
+  getString(item as Record<string, unknown>, 'newTaskId', 'NewTaskId') ||
+  getString(item as Record<string, unknown>, 'newTaskID', 'NewTaskID');
+
+const getTaskStatus = (item: TaskDetailsTask) =>
+  getString(item as Record<string, unknown>, 'taskStatus', 'TaskStatus') ||
+  'Unknown';
+
+const getStatusColor = (status: string) => {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === 'ongoing') {
+    return '#FF9800';
+  }
+  if (normalized === 'completed') {
+    return '#18a957';
+  }
+  if (normalized === 'rejected') {
+    return '#d32f2f';
+  }
+  if (normalized === 'inactive') {
+    return '#7E8794';
+  }
+  if (normalized === 'onhold') {
+    return '#9c27b0';
+  }
+  return THEME_PRIMARY;
+};
+
+const getFieldworkerAvailability = (status: string) => {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === 'inactive') {
+    return 'is currently Absent or Unavailable';
+  }
+  if (normalized === 'onhold') {
+    return 'is currently On Hold';
+  }
+  if (normalized === 'ongoing') {
+    return 'is currently working on this task';
+  }
+  if (normalized === 'completed') {
+    return 'has completed this task';
+  }
+  if (normalized === 'rejected') {
+    return 'has rejected this task';
+  }
+  return '';
+};
+
+const NA = 'NA';
+
+const valueOrNA = (value: string) => (value ? value : NA);
+
+// Java: DateUtils.getDate(epochMillis, "dd-MM-yyyy hh:mm aa") for start/end, and
+// convertDateFormat(iso, ..., "dd-MM-yyyy h:mm a") for the OnHold date.
+const formatJavaDateTime = (raw: unknown, padHour: boolean) => {
+  if (raw === null || raw === undefined || raw === '' || raw === 0) {
+    return '';
+  }
+  const date = typeof raw === 'number' ? new Date(raw) : new Date(String(raw));
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const hours12 = date.getHours() % 12 || 12;
+  const meridiem = date.getHours() >= 12 ? 'PM' : 'AM';
+  return `${pad(date.getDate())}-${pad(date.getMonth() + 1)}-${date.getFullYear()} ${padHour ? pad(hours12) : hours12}:${pad(date.getMinutes())} ${meridiem}`;
+};
+
+const getIssuedQty = (item: TasksListMultipleItemAssigned) => {
+  const value = item.ItemQuantity;
+  return value === undefined || value === null ? NA : String(value);
+};
+
+const getUsedQty = (item: TasksListMultipleItemAssigned) => {
+  const value = item.UsedItemQty;
+  return value === undefined || value === null ? '0' : String(value);
+};
+
+/** dialog_task_details.xml: the 300dp map with the task's pin (title = task, snippet = customer). */
+const CompletedTaskMap = ({latitude, longitude, title, customerName}: {
+  latitude: number;
+  longitude: number;
+  title: string;
+  customerName: string;
+}) => {
+  const markerRef = useRef<React.ComponentRef<typeof Marker> | null>(null);
+  if (!latitude || !longitude) {
+    return <View style={styles.completedMapEmpty} />;
+  }
+  return (
+    <View style={styles.completedMap}>
+      <MapView
+        style={StyleSheet.absoluteFill}
+        provider={PROVIDER_GOOGLE}
+        customMapStyle={FIELDWEB_MAP_STYLE}
+        showsUserLocation
+        showsMyLocationButton={false}
+        zoomControlEnabled
+        onMapReady={() => markerRef.current?.showCallout()}
+        initialRegion={{latitude, longitude, latitudeDelta: 0.2, longitudeDelta: 0.2}}>
+        <Marker
+          ref={markerRef}
+          coordinate={{latitude, longitude}}
+          anchor={{x: 0.5, y: 0.5}}
+          title={title}
+          description={customerName}>
+          <FieldWebLocationPin size={ms(35)} />
+        </Marker>
+      </MapView>
+    </View>
+  );
+};
+
+const getItemName = (item: TasksListMultipleItemAssigned) =>
+  getStringField(item as Record<string, unknown>, ['itemName', 'ItemName']) ||
+  'Item';
+
+const openWhatsapp = (phone: string) => {
+  const digits = phone.replace(/\D/g, '');
+  if (!digits) {
+    return;
+  }
+  Linking.openURL(`https://wa.me/${digits}`).catch(() => {});
+};
+
+const openCall = (phone: string) => {
+  const digits = phone.replace(/\D/g, '');
+  if (!digits) {
+    return;
+  }
+  Linking.openURL(`tel:${digits}`).catch(() => {});
+};
+
+const TaskDetailsScreen = ({
+  ownerId,
+  taskId,
+  fallbackTask,
+  customerName,
+  customerPhone,
+  customerAddress,
+  onBack,
+  hideBackBar,
+  underAppHeader,
+  source = 'crm',
+  sheetStyle = false,
+}: TaskDetailsScreenProps) => {
+  const {t} = useTranslation();
+  const pdf = usePdfDownload();
+  const closureRef = useRef<TaskClosureSectionHandle>(null);
+  const insets = useSafeAreaInsets();
+  // With the shared (absolute) AppHeader above and no back bar, push the whole screen below it.
+  const headerOffset = hideBackBar && underAppHeader ? insets.top + HEADER_CONTENT_HEIGHT : 0;
+  const [closureLoaded, setClosureLoaded] = useState(false);
+  const [hasQrScans, setHasQrScans] = useState(false);
+  const [task, setTask] = useState<TaskDetailsTask | null>(fallbackTask ?? null);
+  const [reassignValues, setReassignValues] = useState<AddTaskInitialValues | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState('');
+  const avatarRotation = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const rotateLoop = Animated.loop(
+      Animated.timing(avatarRotation, {
+        toValue: 1,
+        duration: 10000,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      }),
+    );
+    rotateLoop.start();
+    return () => rotateLoop.stop();
+  }, [avatarRotation]);
+
+  const avatarRotationStyle = {
+    transform: [
+      {
+        rotate: avatarRotation.interpolate({
+          inputRange: [0, 1],
+          outputRange: ['0deg', '360deg'],
+        }),
+      },
+    ],
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+    const fetchTaskDetails = async () => {
+      setIsLoading(true);
+      setError('');
+      try {
+        const response = await getTaskById({
+          UserId: ownerId,
+          TaskId: taskId,
+        });
+        const result: TasksList['ResultData'] = response?.ResultData ?? undefined;
+        const item = Array.isArray(result) ? result[0] ?? null : result ?? null;
+        if (isMounted && item) {
+          setTask(item);
+        }
+      } catch (fetchError) {
+        if (isMounted) {
+          const message =
+            fetchError instanceof Error
+              ? fetchError.message
+              : 'Unable to load task details.';
+          setError(message);
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoading(false);
+        }
+      }
+    };
+
+    if (taskId) {
+      fetchTaskDetails();
+    } else {
+      setIsLoading(false);
+    }
+
+    return () => {
+      isMounted = false;
+    };
+  }, [ownerId, taskId]);
+
+  const record = (task ?? {}) as Record<string, unknown>;
+
+  // Java replaces the item table with the closure's MultipleItemAssigned (issued + used per item)
+  // once a completed task's closure details load.
+  const [closureItems, setClosureItems] = useState<TasksListMultipleItemAssigned[] | null>(null);
+  const isCompletedTask = (task ? getTaskStatus(task) : '').toLowerCase() === 'completed';
+  const closureTaskId = getNumberField(record, ['id', 'Id']) || taskId;
+  useEffect(() => {
+    if (!sheetStyle || !isCompletedTask || !closureTaskId) {
+      return undefined;
+    }
+    let active = true;
+    getTaskClosureDetails({UserId: ownerId, TaskID: closureTaskId})
+      .then(response => {
+        const items = (response?.ResultData as Record<string, unknown> | undefined)?.MultipleItemAssigned;
+        if (active && Array.isArray(items) && items.length > 0) {
+          setClosureItems(items as TasksListMultipleItemAssigned[]);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [sheetStyle, isCompletedTask, closureTaskId, ownerId]);
+
+  // Tasks created without coordinates (e.g. an address typed by hand) have no map pin, so look the
+  // task's address up on Google and use that as the destination instead.
+  const taskLat = Number(record.Latitude ?? record.latitude) || 0;
+  const taskLng = Number(record.Longitude ?? record.longitude) || 0;
+  const addressForMap =
+    getStringField(record, ['fullAddress', 'FullAddress', 'address', 'Address']) || customerAddress || '';
+  const [geocodedDestination, setGeocodedDestination] = useState<{latitude: number; longitude: number} | null>(null);
+  useEffect(() => {
+    if ((taskLat && taskLng) || !addressForMap.trim()) {
+      setGeocodedDestination(null);
+      return undefined;
+    }
+    let active = true;
+    geocodeAddress(addressForMap).then(found => {
+      if (active) {
+        setGeocodedDestination(found);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [taskLat, taskLng, addressForMap]);
+
+  // The discount given on a task lives on its invoice (InvoiceDetails: Discount % and
+  // DiscountAmounnt), so fetch it by the task's InvoiceId.
+  const invoiceId = getNumberField(record, ['invoiceId', 'InvoiceId']);
+  const [invoiceDiscount, setInvoiceDiscount] = useState<{amount: number; percent: number} | null>(null);
+  useEffect(() => {
+    if (!invoiceId) {
+      setInvoiceDiscount(null);
+      return undefined;
+    }
+    let active = true;
+    getInvoicedetailsByInvoiceId({InvoiceId: invoiceId, UserId: ownerId})
+      .then(response => {
+        const data: any = response?.ResultData;
+        const row = Array.isArray(data) ? data[0] : data;
+        const amount = Number(row?.DiscountAmounnt) || 0;
+        const percent = Number(row?.Discount) || 0;
+        if (active) {
+          setInvoiceDiscount(amount > 0 ? {amount, percent} : null);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setInvoiceDiscount(null);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [invoiceId, ownerId]);
+
+  const status = task ? getTaskStatus(task) : '';
+  // Java shows only "[NewTaskId]" (never the numeric Id). The refetched task can come back
+  // without NewTaskId, so fall back to the row the list passed in rather than the raw Id.
+  const newTaskId =
+    (task ? getNewTaskId(task) : '') ||
+    (fallbackTask ? getNewTaskId(fallbackTask) : '');
+  const displayTaskId = newTaskId;
+
+  const taskName = getStringField(record, ['name', 'Name']);
+  const taskTag = getStringField(record, [
+    'task_TagName',
+    'Task_TagName',
+    'taskTagName',
+    'TaskTagName',
+  ]);
+  // The Java app never shows the raw PaymentMode string here -- it maps it to
+  // a warranty label (CRMTaskDetailsFragmentNew.setData()): "Amc"/"AMC" means
+  // the task is covered under warranty, anything else is out of warranty.
+  const rawPaymentMode = getStringField(record, ['paymentMode', 'PaymentMode']);
+  const paymentMode = rawPaymentMode
+    ? rawPaymentMode.toLowerCase() === 'amc'
+      ? 'In Warranty'
+      : 'Out of Warranty'
+    : '';
+  const employeeName = getStringField(record, ['assignedTo', 'AssignedTo']);
+
+  const itemDetails =
+    closureItems ??
+    (record.itemDetails as TasksListMultipleItemAssigned[] | undefined) ??
+    (record.ItemDetails as TasksListMultipleItemAssigned[] | undefined) ??
+    (record.multipleItemAssigned as TasksListMultipleItemAssigned[] | undefined) ??
+    (record.MultipleItemAssigned as TasksListMultipleItemAssigned[] | undefined) ??
+    [];
+
+  const custName =
+    getStringField(record, ['customerName', 'CustomerName']) ||
+    customerName ||
+    '';
+  const custPhone =
+    getStringField(record, ['contactNo', 'ContactNo']) || customerPhone || '';
+  // Java (CRMTaskDetailsFragmentNew.setData()) prefixes the displayed number
+  // and the WhatsApp deep link with the session's country code, but leaves
+  // the `tel:` call intent using the raw contact number as-is.
+  const countryCode = getCurrentCountryCode();
+  const custPhoneDisplay = custPhone
+    ? countryCode
+      ? `+${countryCode} ${custPhone}`
+      : custPhone
+    : '';
+  const custPhoneWhatsapp = countryCode ? `${countryCode}${custPhone}` : custPhone;
+  const custAddress =
+    getStringField(record, ['fullAddress', 'FullAddress']) ||
+    customerAddress ||
+    '';
+  const landmark = getStringField(record, [
+    // Java's CRMTaskDetailsFragmentNew/TaskDetailsFragmentNew both populate
+    // the "Landmark" field from LocationDesc -- there is no LandMark field
+    // on the task DTO at all.
+    'locationDesc',
+    'LocationDesc',
+  ]);
+
+  // Java shows both Response Code and Satisfaction Code as "NA" together if
+  // *either* one is 0 (CRMTaskDetailsFragmentNew.setData()); Satisfaction
+  // Code itself comes from HappyCode -- there is no SatisfactionCode field.
+  const responseCodeNum = getNumberField(record, ['responseCode', 'ResponseCode']);
+  const satisfactionCodeNum = getNumberField(record, ['happyCode', 'HappyCode']);
+  const hasCodes = responseCodeNum > 0 && satisfactionCodeNum > 0;
+  const responseCode = hasCodes ? String(responseCodeNum) : '';
+  const satisfactionCode = hasCodes ? String(satisfactionCodeNum) : '';
+  // EstimatedAmount is WagesPerHours, EarnedAmount is EarningAmount (Java setData()).
+  const wagesPerHour = getNumberField(record, ['wagesPerHours', 'WagesPerHours']);
+  const earningAmount = getNumberField(record, ['earningAmount', 'EarningAmount']);
+  const currencySymbol = (() => {
+    const symbol = getCurrentCurrencySymbol();
+    return !symbol || symbol === 'Rs.' ? '₹' : symbol;
+  })();
+  const estimatedAmount = wagesPerHour ? `${currencySymbol} ${formatAmount(wagesPerHour)}` : '';
+  const earnedAmount = earningAmount ? `${currencySymbol} ${formatAmount(earningAmount)}` : '';
+  // Discount from the invoice, shown on its own row and taken off the earned amount.
+  // The technician's discount (an amount) comes back on the task record itself; the invoice's
+  // discount is the fallback for tasks invoiced elsewhere.
+  const taskDiscount = getNumberField(record, ['taskDiscountedAmount', 'TaskDiscountedAmount', 'discountAmount', 'DiscountAmount']);
+  const discountAmount = taskDiscount || invoiceDiscount?.amount || 0;
+  const discountText = discountAmount
+    ? `${currencySymbol} ${formatAmount(discountAmount)}${
+        !taskDiscount && invoiceDiscount?.percent ? ` (${Number(invoiceDiscount.percent.toFixed(3))}%)` : ''
+      }`
+    : '';
+  // A technician discount is already taken off the stored total (NewWagePerHours), so only the
+  // invoice discount is subtracted from the earned amount here.
+  const netEarnedAmount =
+    !taskDiscount && discountAmount && earningAmount
+      ? `${currencySymbol} ${formatAmount(Math.max(earningAmount - discountAmount, 0))}`
+      : '';
+
+  // Warranty (Java's txtWarrantyType/.../txtWarrantySerialNo, sourced from
+  // TaskWarrantyDetailsModelDtoView on the same task record).
+  const warrantyDetail =
+    (record.taskWarrantyDetailsModelDtoView as Record<string, unknown> | undefined) ??
+    (record.TaskWarrantyDetailsModelDtoView as Record<string, unknown> | undefined) ??
+    {};
+  const warrantyTypeName = getStringField(warrantyDetail, ['warrantyTypeName', 'WarrantyTypeName']);
+  const warrantyStartDate = getStringField(warrantyDetail, ['startDate', 'StartDate']);
+  const warrantyEndDate = getStringField(warrantyDetail, ['endDate', 'EndDate']);
+  const warrantyBrandName = getStringField(warrantyDetail, ['brandName', 'BrandName']);
+  const warrantyModelName = getStringField(warrantyDetail, ['modelName', 'ModelName']);
+  const warrantySerialNo = getStringField(warrantyDetail, ['serialNoName', 'SerialNoName']);
+
+  const fieldworkerAvailability = getFieldworkerAvailability(status);
+  // Java opens completed tasks with downloadReport + allowToReassign
+  // (MainTaskFragmentNew -> TaskDetailsFragmentNew / CRMTaskDetailsFragmentNew).
+  const isCompleted = status.toLowerCase() === 'completed';
+
+    // Fetches the task report link, then downloads it with the loading overlay and opens it in the
+    // in-app viewer (or the device's apps for non-PDF files).
+    const handleDownloadReport = async () => {
+      const id = getNumberField(record, ['id', 'Id']) || taskId;
+      try {
+        const response = await downloadReport({UserId: ownerId, TaskID: id});
+        const reportUrl = String(response?.Message ?? '').trim();
+        if (response?.Code === '200' && reportUrl) {
+          await pdf.openFile(reportUrl, `TaskDetail_${taskId}`);
+        } else {
+          showFailureMsg(response?.Message || 'Could not generate the task report.');
+        }
+      } catch (err) {
+        showFailureMsg(toUserMessage(err, 'Could not download the report. Please try again.'));
+      }
+    };
+
+  const startDateTime = formatJavaDateTime(record.StartDate ?? record.startDate, true);
+  const endDateTime = formatJavaDateTime(record.EndDate ?? record.endDate, true);
+  // OnHold rows/photos are only shown for OnHold tasks (CRMTaskDetailsFragmentNew).
+  const isOnHold = status.replace(/\s/g, '').toLowerCase() === 'onhold';
+  const isRejected = status.toLowerCase() === 'rejected';
+  const showCompletedLayout = source === 'taskList' && (isCompleted || isRejected);
+  // Every other status from the owner task list opens OwnerTaskTrackingFragmentNew.
+  const showTrackingLayout = source === 'taskList' && !!task && !showCompletedLayout;
+  const serviceName = getStringField(record, ['serviceName', 'ServiceName']);
+  // Warranty Details is shown for every task status, after Customer Details (Java
+  // always shows the section; missing values read -NA-).
+  const renderWarrantySection = () => (
+    <>
+      <Text style={[styles.sectionHeading, styles.sectionSpacing]}>{t('warranty_details')}</Text>
+      {renderRows([
+        ['Warranty Type', warrantyTypeName || '-NA-'],
+        ['Start Date', warrantyStartDate || '-NA-'],
+        ['End Date', warrantyEndDate || '-NA-'],
+        ['Brand Name', warrantyBrandName || '-NA-'],
+        ['Model Name', warrantyModelName || '-NA-'],
+        ['Serial No', warrantySerialNo || '-NA-'],
+      ])}
+    </>
+  );
+
+  const renderRows = (rows: [string, string][]) =>
+    rows.map(([label, value]) => (
+      <View key={label} style={styles.fieldRow}>
+        <Text style={styles.fieldLabel}>{label}</Text>
+        <Text style={styles.fieldValue}>{value}</Text>
+      </View>
+    ));
+  const paymentModeId = getNumberField(record, ['paymentModeId', 'PaymentModeId']);
+  const onHold =
+    (record.OnHoldTaskDtos as Record<string, unknown> | undefined) ??
+    (record.onHoldTaskDtos as Record<string, unknown> | undefined) ??
+    {};
+  const onHoldDateTime = formatJavaDateTime(onHold.CreatedDate ?? onHold.createdDate, false);
+  const onHoldReason = getStringField(onHold, ['onHoldNotes', 'OnHoldNotes']);
+  const onHoldPhotos = [onHold.Pick1, onHold.Pick2, onHold.Pick3]
+    .map(p => String(p ?? '').trim())
+    .filter(Boolean);
+
+  return (
+    <View style={[styles.screen, headerOffset ? {paddingTop: headerOffset} : null]}>
+      {hideBackBar ? null : <BackBar onBack={onBack} underAppHeader={underAppHeader} />}
+
+      {showTrackingLayout ? (
+        <OwnerTaskTrackingMap
+          technicianId={getNumberField(record, ['userId', 'UserId'])}
+          technicianName={employeeName}
+          isOngoing={status.toLowerCase() === 'ongoing'}
+          fieldLatitude={taskLat || geocodedDestination?.latitude || 0}
+          fieldLongitude={taskLng || geocodedDestination?.longitude || 0}
+          taskName={taskName}
+          customerName={custName}
+        />
+      ) : null}
+      {showCompletedLayout || showTrackingLayout || sheetStyle ? null : (
+      <View style={styles.avatarWrap}>
+        <Animated.View style={[styles.avatarCircle, avatarRotationStyle]}>
+          <Text style={styles.avatarIcon}>👤</Text>
+        </Animated.View>
+        {employeeName ? (
+          <Text style={styles.avatarName}>{employeeName}</Text>
+        ) : null}
+        {fieldworkerAvailability ? (
+          <Text style={styles.avatarAvailability}>
+            {fieldworkerAvailability}
+          </Text>
+        ) : null}
+      </View>
+      )}
+
+      {isLoading && !task ? (
+        <View style={styles.centerBox}>
+          <ActivityIndicator color={THEME_PRIMARY} size="large" />
+        </View>
+      ) : error && !task ? (
+        <View style={styles.centerBox}>
+          <Text style={styles.errorText}>{error}</Text>
+        </View>
+      ) : showTrackingLayout ? (
+        // OwnerTaskTrackingFragmentNew / owner_task_tracking_fragment_new.xml, in XML order.
+        <ScrollView style={styles.body} contentContainerStyle={styles.bodyContent}>
+          <View style={styles.statusActionsRow}>
+            <Text style={[styles.statusLabel, {color: getStatusColor(status)}]}>{status || NA}</Text>
+            <View style={styles.actionIconsRow}>
+              <TouchableOpacity style={styles.actionIconButton} onPress={() => openWhatsapp(custPhoneWhatsapp)}>
+                <Ionicons name="logo-whatsapp" style={styles.actionIconText} />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.actionIconButton} onPress={() => openCall(custPhone)}>
+                <Ionicons name="call-outline" style={styles.actionIconText} />
+              </TouchableOpacity>
+            </View>
+          </View>
+          <View style={styles.titleRow}>
+            <Text style={styles.sectionHeading}>{t('task_details_title')}</Text>
+            {displayTaskId ? <Text style={styles.taskIdText}> [{displayTaskId}]</Text> : null}
+          </View>
+          {renderRows([
+            ['Task Name', valueOrNA(taskName)],
+            ['Task Tag', valueOrNA(taskTag)],
+            // Java hides the row unless the task has an estimated amount.
+            ...(wagesPerHour ? ([['Estimated Amount', `Rs. ${formatAmount(wagesPerHour)}`]] as [string, string][]) : []),
+            ['Payment Mode', valueOrNA(paymentMode)],
+            ['Fieldworker', valueOrNA(employeeName)],
+            ...(isOnHold
+              ? ([
+                  ['OnHold Date & Time', valueOrNA(onHoldDateTime)],
+                  ['OnHold Reason', valueOrNA(onHoldReason)],
+                ] as [string, string][])
+              : []),
+          ])}
+
+          <View style={styles.itemDetailsHeaderRow}>
+            <Text style={[styles.sectionHeading, styles.itemNameHeading]}>{t('item_details')}</Text>
+            <Text style={styles.itemColumnHeading}>{t('issued_qty')}</Text>
+            <Text style={styles.itemColumnHeading}>{t('used_qty')}</Text>
+          </View>
+          {itemDetails.map((item, index) => (
+            <View key={index} style={styles.itemDetailsRow}>
+              <Text style={styles.itemName} numberOfLines={1}>{getItemName(item)}</Text>
+              <Text style={styles.itemQty}>{getIssuedQty(item)}</Text>
+              <Text style={styles.itemQty}>{getUsedQty(item)}</Text>
+            </View>
+          ))}
+
+          <Text style={[styles.sectionHeading, styles.sectionSpacing]}>{t('customer_details')}</Text>
+          {renderRows([
+            ['Customer Name', valueOrNA(custName)],
+            ['Customer Number', valueOrNA(custPhoneDisplay)],
+            ['Address', valueOrNA(custAddress)],
+            ['Landmark', valueOrNA(landmark)],
+          ])}
+
+          {serviceName ? (
+            <>
+              <Text style={[styles.sectionHeading, styles.sectionSpacing]}>{t('service_details')}</Text>
+              {renderRows([['Service Name', serviceName]])}
+            </>
+          ) : null}
+
+          <Text style={[styles.sectionHeading, styles.sectionSpacing]}>{t('rn_code_s_detail')}</Text>
+          {renderRows([
+            ['Response Code:', valueOrNA(responseCode)],
+            ['Satisfaction Code:', valueOrNA(satisfactionCode)],
+          ])}
+
+          {renderWarrantySection()}
+
+          {isOnHold && onHoldPhotos.length > 0 ? (
+            <>
+              <Text style={[styles.sectionHeading, styles.sectionSpacing]}>{t('on_hold_photos')}</Text>
+              <View style={styles.onHoldPhotoRow}>
+                {onHoldPhotos.map(uri => (
+                  <Image key={uri} source={{uri}} style={styles.onHoldPhoto} />
+                ))}
+              </View>
+            </>
+          ) : null}
+        </ScrollView>
+      ) : showCompletedLayout && task ? (
+        // TaskDetailsFragmentNew / dialog_task_details.xml, in XML order: a 300dp map and the
+        // status row stay in place, everything below scrolls.
+        <View style={styles.body}>
+        <CompletedTaskMap
+          latitude={taskLat || geocodedDestination?.latitude || 0}
+          longitude={taskLng || geocodedDestination?.longitude || 0}
+          title={taskName}
+          customerName={custName}
+        />
+        <View style={styles.completedStatusRow}>
+          <View style={styles.statusActionsRow}>
+            <Text style={[styles.statusLabel, {color: getStatusColor(status)}]}>{status || NA}</Text>
+            <View style={styles.actionIconsRow}>
+              <TouchableOpacity style={styles.actionIconButton} onPress={() => openWhatsapp(custPhoneWhatsapp)}>
+                <Ionicons name="logo-whatsapp" size={ms(24)} color={COLORS.primary} />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.actionIconButton} onPress={() => openCall(custPhone)}>
+                <Ionicons name="call-outline" size={ms(24)} color={COLORS.primary} />
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.actionIconButton}
+                onPress={() =>
+                  setReassignValues(
+                    buildTaskFormValues(task as never, isCompleted ? 'reassignCompleted' : 'reassign'),
+                  )
+                }>
+                <Ionicons name="refresh" size={ms(24)} color={COLORS.primary} />
+              </TouchableOpacity>
+              {hasQrScans ? (
+                <TouchableOpacity style={styles.actionIconButton} onPress={() => closureRef.current?.openQrHistory()}>
+                  <Ionicons name="qr-code-outline" style={styles.actionIconText} />
+                </TouchableOpacity>
+              ) : null}
+              {isCompleted ? (
+                <TouchableOpacity style={styles.actionIconButton} onPress={handleDownloadReport}>
+                  <Ionicons name="download-outline" style={styles.actionIconText} />
+                </TouchableOpacity>
+              ) : null}
+            </View>
+          </View>
+        </View>
+        <ScrollView style={styles.body} contentContainerStyle={styles.completedBodyContent}>
+          <View style={styles.titleRow}>
+            <Text style={styles.sectionHeading}>{t('task_details_title')}</Text>
+            {displayTaskId ? <Text style={styles.taskIdText}> [{displayTaskId}]</Text> : null}
+          </View>
+          {(
+            [
+              ['Task Name', valueOrNA(taskName)],
+              ['Task Tag', valueOrNA(taskTag)],
+              ['Employee Name', valueOrNA(employeeName)],
+              // dialog_task_details.xml hides the Estimated / Earned Amount rows (visibility=gone);
+              // the amounts are shown under Payment Details instead.
+              ['Payment Mode', valueOrNA(paymentMode)],
+              ['Start Date & Time', valueOrNA(startDateTime)],
+              ['End Date & Time', valueOrNA(endDateTime)],
+            ] as [string, string][]
+          ).map(([label, value]) => (
+            <View key={label} style={styles.fieldRow}>
+              <Text style={styles.fieldLabel}>{label}</Text>
+              <Text style={styles.fieldValue}>{value}</Text>
+            </View>
+          ))}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('attachment')}</Text>
+            <Text style={[styles.fieldValue, styles.linkText]} onPress={() => closureRef.current?.openDocuments()}>
+              {t('view_attachment')}
+            </Text>
+          </View>
+
+          <View style={styles.itemDetailsHeaderRow}>
+            <Text style={[styles.sectionHeading, styles.itemNameHeading]}>{t('item_details')}</Text>
+            <Text style={styles.itemColumnHeading}>{t('issued_qty')}</Text>
+            <Text style={styles.itemColumnHeading}>{t('used_qty')}</Text>
+          </View>
+          {itemDetails.map((item, index) => (
+            <View key={index} style={styles.itemDetailsRow}>
+              <Text style={styles.itemName} numberOfLines={1}>{getItemName(item)}</Text>
+              <Text style={styles.itemQty}>{getIssuedQty(item)}</Text>
+              <Text style={styles.itemQty}>{getUsedQty(item)}</Text>
+            </View>
+          ))}
+
+          <Text style={[styles.sectionHeading, styles.sectionSpacing]}>{t('customer_details')}</Text>
+          {(
+            [
+              ['Customer Name', valueOrNA(custName)],
+              ['Customer Number', valueOrNA(custPhoneDisplay)],
+              ['Address', valueOrNA(custAddress)],
+              ['Landmark', valueOrNA(landmark)],
+            ] as [string, string][]
+          ).map(([label, value]) => (
+            <View key={label} style={styles.fieldRow}>
+              <Text style={styles.fieldLabel}>{label}</Text>
+              <Text style={styles.fieldValue}>{value}</Text>
+            </View>
+          ))}
+
+          {renderWarrantySection()}
+
+          <TaskClosureSection
+            ref={closureRef}
+            ownerId={ownerId}
+            taskId={getNumberField(record, ['id', 'Id']) || taskId}
+            taskName={taskName}
+            newTaskId={newTaskId}
+            customerId={getNumberField(record, ['customerDetailsid', 'CustomerDetailsid'])}
+            isRejected={isRejected}
+            paymentMode={rawPaymentMode}
+            earningAmount={earningAmount}
+            discountAmount={taskDiscount}
+            currencySymbol={currencySymbol}
+            assignedTo={employeeName}
+            onClosureLoaded={setClosureLoaded}
+            onQrAvailable={setHasQrScans}
+          />
+        </ScrollView>
+        </View>
+      ) : (
+        <ScrollView
+          style={[styles.body, sheetStyle ? styles.bodySheet : null]}
+          contentContainerStyle={[styles.bodyContent, sheetStyle ? styles.bodyContentSheet : null]}
+        >
+          {sheetStyle ? (
+            <Image
+              source={
+                getStringField(record, ['photo', 'Photo'])
+                  ? {uri: getStringField(record, ['photo', 'Photo'])}
+                  : require('../../../assets/images/profile_icon.png')
+              }
+              style={styles.sheetAvatar}
+            />
+          ) : null}
+          <View style={styles.statusActionsRow}>
+            <Text
+              style={[styles.statusLabel, {color: getStatusColor(status)}]}
+            >
+              {status || NA}
+            </Text>
+            {/* dialog_crm_task_details.xml order: message, call, reassign, download */}
+            <View style={styles.actionIconsRow}>
+              <TouchableOpacity
+                style={styles.actionIconButton}
+                onPress={() => openWhatsapp(custPhoneWhatsapp)}
+              >
+                <Ionicons name="logo-whatsapp" style={styles.actionIconText} />
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.actionIconButton}
+                onPress={() => openCall(custPhone)}
+              >
+                <Ionicons name="call-outline" style={styles.actionIconText} />
+              </TouchableOpacity>
+              {isCompleted && task ? (
+                <>
+                  <TouchableOpacity
+                    style={styles.actionIconButton}
+                    onPress={() =>
+                      setReassignValues(buildTaskFormValues(task as never, 'reassignCompleted'))
+                    }>
+                    <Ionicons name="refresh" style={styles.actionIconText} />
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.actionIconButton} onPress={handleDownloadReport}>
+                    <Ionicons name="download-outline" style={styles.actionIconText} />
+                  </TouchableOpacity>
+                </>
+              ) : null}
+            </View>
+          </View>
+
+          <View style={styles.titleRow}>
+            <Text style={styles.sectionHeading}>{t('task_details_title')}</Text>
+            {displayTaskId ? (
+              <Text style={styles.taskIdText}> [{displayTaskId}]</Text>
+            ) : null}
+          </View>
+
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('task_name')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(taskName)}</Text>
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('rn_task_tag')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(taskTag)}</Text>
+          </View>
+          {/* Row order follows dialog_crm_task_details.xml. Task Type is
+              'gone' there, so it isn't shown here either. */}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('estimated_amount')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(estimatedAmount)}</Text>
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('payment_mode')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(paymentMode)}</Text>
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('technician_name')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(employeeName)}</Text>
+          </View>
+          {isOnHold ? (
+            <>
+              <View style={styles.fieldRow}>
+                <Text style={styles.fieldLabel}>{t('on_hold_date_time')}</Text>
+                <Text style={styles.fieldValue}>{valueOrNA(onHoldDateTime)}</Text>
+              </View>
+              <View style={styles.fieldRow}>
+                <Text style={styles.fieldLabel}>{t('on_hold_reason')}</Text>
+                <Text style={styles.fieldValue}>{valueOrNA(onHoldReason)}</Text>
+              </View>
+            </>
+          ) : null}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('earned_amount_title')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(earnedAmount)}</Text>
+          </View>
+          {discountText ? (
+            <>
+              <View style={styles.fieldRow}>
+                <Text style={styles.fieldLabel}>{t('discount')}</Text>
+                <Text style={styles.fieldValue}>{discountText}</Text>
+              </View>
+              {netEarnedAmount ? (
+                <View style={styles.fieldRow}>
+                  <Text style={styles.fieldLabel}>{t('rn_net_amount')}</Text>
+                  <Text style={styles.fieldValue}>{netEarnedAmount}</Text>
+                </View>
+              ) : null}
+            </>
+          ) : null}
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('start_date_amp_time')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(startDateTime)}</Text>
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('end_date_amp_time')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(endDateTime)}</Text>
+          </View>
+
+          <View style={styles.itemDetailsHeaderRow}>
+            <Text style={[styles.sectionHeading, styles.itemNameHeading]}>
+              {t('item_details')}
+            </Text>
+            <Text style={styles.itemColumnHeading}>{t('issued_qty')}</Text>
+            <Text style={styles.itemColumnHeading}>{t('used_qty')}</Text>
+          </View>
+          {itemDetails.length > 0 ? (
+            itemDetails.map((item, index) => (
+              <View key={index} style={styles.itemDetailsRow}>
+                <Text style={styles.itemName} numberOfLines={1}>
+                  {getItemName(item)}
+                </Text>
+                <Text style={styles.itemQty}>{getIssuedQty(item)}</Text>
+                <Text style={styles.itemQty}>{getUsedQty(item)}</Text>
+              </View>
+            ))
+          ) : null}
+
+
+          <Text style={[styles.sectionHeading, styles.sectionSpacing]}>
+            {t('customer_details')}
+          </Text>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('customer_name')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(custName)}</Text>
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('customer_number')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(custPhoneDisplay)}</Text>
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('address')}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(custAddress)}</Text>
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('landmark')}</Text>
+            <Text style={styles.fieldValue}>
+              {landmark ? landmark : 'na'}
+            </Text>
+          </View>
+
+          {/* Warranty Details is always visible in Java, after Customer Details. */}
+          {(
+            <>
+              <Text style={[styles.sectionHeading, styles.sectionSpacing]}>
+                {t('warranty_details')}
+              </Text>
+              <View style={styles.fieldRow}>
+                <Text style={styles.fieldLabel}>{t('warranty_type')}</Text>
+                <Text style={styles.fieldValue}>{valueOrNA(warrantyTypeName)}</Text>
+              </View>
+              <View style={styles.fieldRow}>
+                <Text style={styles.fieldLabel}>{t('task_start_date')}</Text>
+                <Text style={styles.fieldValue}>{valueOrNA(warrantyStartDate)}</Text>
+              </View>
+              <View style={styles.fieldRow}>
+                <Text style={styles.fieldLabel}>{t('task_end_date')}</Text>
+                <Text style={styles.fieldValue}>{valueOrNA(warrantyEndDate)}</Text>
+              </View>
+              <View style={styles.fieldRow}>
+                <Text style={styles.fieldLabel}>{t('label_brand_name')}</Text>
+                <Text style={styles.fieldValue}>{valueOrNA(warrantyBrandName)}</Text>
+              </View>
+              <View style={styles.fieldRow}>
+                <Text style={styles.fieldLabel}>{t('label_model_name')}</Text>
+                <Text style={styles.fieldValue}>{valueOrNA(warrantyModelName)}</Text>
+              </View>
+              <View style={styles.fieldRow}>
+                <Text style={styles.fieldLabel}>{t('label_serial_no')}</Text>
+                <Text style={styles.fieldValue}>{valueOrNA(warrantySerialNo)}</Text>
+              </View>
+            </>
+          )}
+
+          <Text style={[styles.sectionHeading, styles.sectionSpacing]}>
+            {t('rn_code_s_detail')}
+          </Text>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('enter_response_code') + ':'}</Text>
+            <Text style={styles.fieldValue}>{valueOrNA(responseCode)}</Text>
+          </View>
+          <View style={styles.fieldRow}>
+            <Text style={styles.fieldLabel}>{t('enter_satisfaction_code') + ':'}</Text>
+            <Text style={styles.fieldValue}>
+              {valueOrNA(satisfactionCode)}
+            </Text>
+          </View>
+
+          {isOnHold && onHoldPhotos.length > 0 ? (
+            <>
+              <Text style={[styles.sectionHeading, styles.sectionSpacing]}>
+                {t('on_hold_photos')}
+              </Text>
+              <View style={styles.onHoldPhotoRow}>
+                {onHoldPhotos.map(uri => (
+                  <Image key={uri} source={{uri}} style={styles.onHoldPhoto} />
+                ))}
+              </View>
+            </>
+          ) : null}
+        </ScrollView>
+      )}
+
+      <AddTaskModal
+        visible={reassignValues !== null}
+        ownerId={ownerId}
+        initialValues={reassignValues}
+        onClose={() => setReassignValues(null)}
+      />
+      {pdf.modals}
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+    backgroundColor: THEME_PRIMARY,
+  },
+  header: {
+    backgroundColor: THEME_PRIMARY,
+    paddingHorizontal: ms(16),
+    paddingVertical: ms(12),
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  headerIconButton: {
+    padding: ms(4),
+  },
+  headerIconText: {
+    color: '#FFFFFF',
+    fontSize: sp(18),
+  },
+  headerRightActions: {
+    flexDirection: 'row',
+    gap: ms(16),
+  },
+  linkText: {
+    color: '#1a73e8',
+    textDecorationLine: 'underline',
+  },
+  onHoldPhotoRow: {
+    flexDirection: 'row',
+    gap: ms(10),
+    marginTop: ms(8),
+  },
+  onHoldPhoto: {
+    width: ms(80),
+    height: ms(80),
+    borderRadius: ms(8),
+    backgroundColor: '#f3f4f6',
+  },
+  centerBox: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  errorText: {
+    color: '#FFFFFF',
+    fontSize: sp(13),
+    paddingHorizontal: ms(24),
+    textAlign: 'center',
+  },
+  body: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+  },
+  bodyContent: {
+    paddingHorizontal: ms(20),
+    paddingTop: ms(20),
+    paddingBottom: ms(110),
+    width: '100%',
+    maxWidth: ms(640),
+    alignSelf: 'center',
+  },
+  bodySheet: {
+    flex: 1,
+    marginTop: ms(10),
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+    overflow: 'hidden',
+  },
+  bodyContentSheet: {
+    paddingTop: ms(5),
+    paddingHorizontal: ms(20),
+  },
+  sheetAvatar: {
+    width: ms(80),
+    height: ms(80),
+    borderRadius: ms(40),
+    margin: ms(5),
+    alignSelf: 'center',
+    marginBottom: ms(10),
+  },
+  avatarWrap: {
+    alignItems: 'center',
+    paddingHorizontal: ms(24),
+    paddingBottom: ms(24),
+  },
+  avatarCircle: {
+    width: ms(64),
+    height: ms(64),
+    borderRadius: ms(32),
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: ms(12),
+  },
+  avatarIcon: {
+    fontSize: sp(30),
+    color: THEME_PRIMARY,
+  },
+  avatarName: {
+    color: '#FFFFFF',
+    fontSize: sp(16),
+    fontWeight: '700',
+    marginBottom: ms(4),
+    textAlign: 'center',
+  },
+  avatarAvailability: {
+    color: '#FFFFFF',
+    fontSize: sp(12),
+    textAlign: 'center',
+  },
+  statusActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: ms(12),
+  },
+  completedMap: {width: '100%', height: ms(300), borderTopLeftRadius: ms(30), borderTopRightRadius: ms(30), overflow: 'hidden', backgroundColor: '#EDE9E0'},
+  completedMapEmpty: {width: '100%', height: ms(40)},
+  completedStatusRow: {paddingHorizontal: ms(20), paddingTop: ms(14), backgroundColor: '#FFFFFF'},
+  completedBodyContent: {paddingHorizontal: ms(20), paddingBottom: ms(110), width: '100%', maxWidth: ms(640), alignSelf: 'center'},
+  statusLabel: {
+    fontSize: sp(16),
+  },
+  actionIconsRow: {
+    flexDirection: 'row',
+    gap: ms(24),
+  },
+  actionIconButton: {
+    padding: ms(2),
+  },
+  actionIconText: {
+    fontSize: ms(26),
+    color: COLORS.primary,
+  },
+  titleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: ms(10),
+  },
+  sectionHeading: {
+    fontSize: sp(14),
+    fontWeight: '700',
+    color: COLORS.ink,
+  },
+  sectionSpacing: {
+    marginTop: ms(16),
+    marginBottom: ms(4),
+  },
+  taskIdText: {
+    fontSize: sp(14),
+    color: COLORS.linkBlue,
+  },
+  fieldRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: ms(3),
+  },
+  fieldLabel: {
+    fontSize: sp(15),
+    color: COLORS.ink,
+    flex: 0.4,
+  },
+  fieldValue: {
+    fontSize: sp(15),
+    color: COLORS.lightGray,
+    flex: 0.6,
+    textAlign: 'left',
+  },
+  itemDetailsHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: ms(16),
+    marginBottom: ms(8),
+  },
+  itemNameHeading: {
+    flex: 1,
+  },
+  itemColumnHeading: {
+    fontSize: sp(13),
+    fontWeight: '700',
+    color: '#1F2937',
+    width: ms(80),
+    textAlign: 'center',
+  },
+  itemDetailsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: ms(6),
+  },
+  itemName: {
+    fontSize: sp(13),
+    color: '#1F2937',
+    flex: 1,
+  },
+  itemQty: {
+    fontSize: sp(13),
+    color: '#9CA3AF',
+    width: ms(80),
+    textAlign: 'center',
+  },
+});
+
+export default TaskDetailsScreen;

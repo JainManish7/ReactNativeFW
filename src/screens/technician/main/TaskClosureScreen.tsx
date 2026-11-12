@@ -1,0 +1,2962 @@
+import { numpadAccessoryId } from '../../../components/NumpadDoneBar';
+// src/screens/technician/main/TaskClosureScreen.tsx
+import { launchCameraWithPermission } from '../../../utils/cameraPermission';
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  Pressable,
+  TextInput,
+  Image,
+  ActivityIndicator,
+  ScrollView,
+  KeyboardAvoidingView,
+  Platform,
+  PanResponder,
+  Keyboard,
+  GestureResponderEvent,
+} from 'react-native';
+import Modal from '../../../components/AppModal';
+import Svg, { Path, Rect } from 'react-native-svg';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { COLORS } from '../../../theme/theme';
+import { getUsedItemIssueListByUserid } from '../../../api/item/itemService';
+import { scale, vs, sp, ms } from '../../../utils/responsive';
+import ImageSourceDialog from '../../../components/ImageSourceDialog';
+import SearchPickerModal from '../../../components/SearchPickerModal';
+import {
+  GetAllTaskListDTOResultData as Task,
+  GetAllTaskListDTODeviceInfoList as DeviceInfo,
+  TaskClosureResultData,
+  TaskClosureTechnicalNotedto,
+  TaskClosureDeviceInfoList,
+  TaskClosureUsedItemDetailsDto,
+} from '../../../api/task/task.types';
+import { launchImageLibrary } from 'react-native-image-picker';
+import { getAllchkpointCategory, postChkpointData } from '../../../api/fsrManagement/fsrManagementService';
+import { requestLocationPermission, getCurrentPosition, getAddressFromCoordinates, Coordinates } from '../../../utils/locationPermision';
+import { buildImagesPayload } from '../../../utils/imagePayload';
+import { getCustomFieldData } from '../../../api/users/usersService';
+import { pick, isErrorWithCode, errorCodes } from '@react-native-documents/picker';
+import RNFS from 'react-native-fs';
+import { showFailureMsg } from '../../../utils/toast';
+import { isNetworkAvailable } from '../../../offline/networkQuality';
+import { savePendingTask } from '../../../offline/offlineStore';
+import { cachedFetch, fsrCacheKey, customFieldsCacheKey } from '../../../offline/offlineCache';
+import DecimalInput from '../../../components/DecimalInput';
+
+import {useTranslation} from 'react-i18next';
+import { tr } from '../../../i18n/tr';
+// ─── Local Types ──────────────────────────────────────────────────────────────
+
+interface PhotoAsset {
+  uri: string;
+  base64?: string;
+}
+
+// Java: callFileAttachmentIntent() accepted only these types, up to 5 MB.
+const ATTACHMENT_MIME_TYPES = [
+  'image/jpeg',
+  'image/png',
+  'application/pdf',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/zip',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'text/plain',
+];
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+
+// Same placeholder Java (TaskClosureFragmentNew.validate) uses when no signature is drawn.
+const EMPTY_SIGNATURE_PNG_BASE64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jK3sAAAAASUVORK5CYII=';
+
+interface AttachmentAsset {
+  uri: string;
+  name: string;
+  type: string;
+  base64: string;
+}
+
+type PendingPhoto =
+  | { type: 'field'; index: number }
+  | { type: 'customerPhoto' }
+  | { type: 'techPhoto' }
+  | { type: 'devicePhoto'; deviceIndex: number; photoKey: 'DevicePhoto1' | 'DevicePhoto2' | 'DevicePhoto3' };
+
+interface SignaturePath {
+  points: { x: number; y: number }[];
+}
+
+interface DeviceEntry extends Partial<DeviceInfo> {
+  DevicePhoto1Uri?: string;
+  DevicePhoto2Uri?: string;
+  DevicePhoto3Uri?: string;
+  // Raw text of the reading while typing, so a trailing '.' isn't lost to Number().
+  DeviceReadingText?: string;
+}
+
+interface WorkModeOption {
+  Id: number;
+  WorkModeType: string;
+}
+
+const WORK_MODES: WorkModeOption[] = [
+  { Id: 1, WorkModeType: 'Installation' },
+  { Id: 2, WorkModeType: 'Repair' },
+  { Id: 3, WorkModeType: 'Services' },
+];
+
+const TASK_STATUS = {
+  COMPLETED: 1,
+  REJECTED: 2,
+  ON_GOING: 3,
+  IN_ACTIVE: 4,
+  ONHOLD: 5,
+} as const;
+
+const TASK_STATE = {
+  NOT_STARTED: 0,
+  STARTED_NOT_ENDED: 1,
+  ENDED_NO_PAYMENT: 2,
+  PAYMENT_RECEIVED: 3,
+  TASK_CLOSURE: 4,
+} as const;
+
+const PAYMENT_MODE_RATE_ID = 2;
+
+interface AssignedSlot {
+  ItemIssuedId: number;
+  ItemId: number;
+  ItemName: string;
+  AssignedQty: number;
+  usedQty: string;
+}
+
+interface AdHocSlot {
+  itemIssuedId: number;
+  itemId: number;
+  itemName: string;
+  salesPrice: number;
+  avlQty: number;
+  usedQty: string;
+}
+
+interface IssueListItem {
+  Id: number;
+  ItemId: number;
+  Name: string;
+  Quantity: number;
+  SalesPrice: number;
+}
+
+interface FSRCheckpoint {
+  CheckpointId: number;
+  CheckpointName: string;
+}
+
+interface FSRCategory {
+  CategoryId: number;
+  CategoryName: string;
+  lstCheckpointDTo: FSRCheckpoint[];
+}
+
+interface FSRStatusOption {
+  CheckpointStatusId: number;
+  CheckpointStatusName: string;
+}
+
+interface SelectedCheckpoint {
+  SelectedCheckpointId: number;
+  FSRId: number;
+  CategoryId: number;
+  CheckpointId: number;
+  CheckpointStatusId: number;
+  InputTextId: number;
+  CreatedBy: number;
+  CreatedDate: string;
+  UpdatedBy: number;
+  UpdatedDate: string;
+  IsActive: boolean;
+  TaskId: any;
+}
+
+// ─── Shared helper ────────────────────────────────────────────────────────────
+
+const buildPathD = (points: { x: number; y: number }[]) => {
+  if (points.length < 2) return '';
+  let d = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length; i++) {
+    d += ` L ${points[i].x} ${points[i].y}`;
+  }
+  return d;
+};
+
+// ─── Signature Pad ────────────────────────────────────────────────────────────
+
+interface SignaturePadProps {
+  paths: SignaturePath[];
+  onPathsChange: (paths: SignaturePath[]) => void;
+  height?: number;
+  onSizeChange?: (size: { width: number; height: number }) => void;
+}
+
+function SignaturePad({ paths, onPathsChange, height = 160, onSizeChange }: SignaturePadProps) {
+  const currentPathRef = useRef<{ x: number; y: number }[]>([]);
+  const pathsRef = useRef(paths);
+  const [, forceUpdate] = useState(0);
+
+  useEffect(() => {
+    pathsRef.current = paths;
+  }, [paths]);
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: (evt: GestureResponderEvent) => {
+        const { locationX, locationY } = evt.nativeEvent;
+        currentPathRef.current = [{ x: locationX, y: locationY }];
+        forceUpdate(n => n + 1);
+      },
+      onPanResponderMove: (evt: GestureResponderEvent) => {
+        const { locationX, locationY } = evt.nativeEvent;
+        currentPathRef.current = [...currentPathRef.current, { x: locationX, y: locationY }];
+        forceUpdate(n => n + 1);
+      },
+      onPanResponderRelease: () => {
+        if (currentPathRef.current.length > 1) {
+          onPathsChange([...pathsRef.current, { points: currentPathRef.current }]);
+        }
+        currentPathRef.current = [];
+        forceUpdate(n => n + 1);
+      },
+    })
+  ).current;
+
+  return (
+    <View
+      style={[sigStyles.padContainer, { height }]}
+      onLayout={e => onSizeChange?.(e.nativeEvent.layout)}
+      {...panResponder.panHandlers}
+    >
+      <Svg width="100%" height="100%" style={StyleSheet.absoluteFill}>
+        {paths.map((path, idx) => (
+          <Path
+            key={idx}
+            d={buildPathD(path.points)}
+            stroke="#1C1C1E"
+            strokeWidth={2.2}
+            fill="none"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        ))}
+        {currentPathRef.current.length > 1 && (
+          <Path
+            d={buildPathD(currentPathRef.current)}
+            stroke="#1C1C1E"
+            strokeWidth={2.2}
+            fill="none"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        )}
+      </Svg>
+    </View>
+  );
+}
+
+const sigStyles = StyleSheet.create({
+  padContainer: {
+    backgroundColor: COLORS.white,
+    overflow: 'hidden',
+    marginTop: vs(6),
+    position: 'relative',
+  },
+});
+
+// ─── Star Rating ──────────────────────────────────────────────────────────────
+
+function StarRating({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  const getStarIcon = (star: number): string => {
+    if (value >= star) return 'star';
+    if (value >= star - 0.5) return 'star-half';
+    return 'star-outline';
+  };
+  const STAR_SIZE = sp(30);
+  return (
+    <View style={{ marginTop: vs(10) }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: scale(4) }}>
+        <Text style={{ fontSize: sp(20), color: COLORS.primary, fontWeight: '600', marginRight: scale(6) }}>
+          {value.toFixed(1)}
+        </Text>
+        {[1, 2, 3, 4, 5].map(star => (
+          <View key={star} style={{ width: STAR_SIZE, height: STAR_SIZE }}>
+            <Ionicons
+              name={getStarIcon(star)}
+              size={STAR_SIZE}
+              color={value >= star - 0.5 ? COLORS.primary : '#C0C0C0'}
+            />
+            <Pressable
+              onPress={() => onChange(value === star - 0.5 ? 0 : star - 0.5)}
+              style={{ position: 'absolute', left: 0, top: 0, width: STAR_SIZE / 2, height: STAR_SIZE }}
+            />
+            <Pressable
+              onPress={() => onChange(value === star ? 0 : star)}
+              style={{ position: 'absolute', right: 0, top: 0, width: STAR_SIZE / 2, height: STAR_SIZE }}
+            />
+          </View>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+// ─── Signature → PNG ─────────────────────────────────────────────────────────
+//
+// Java posts the signature as a PNG bitmap (base64). The old code here base64-encoded the
+// text of an SVG, which the server would store as a broken .png. react-native-svg can
+// rasterise a mounted <Svg> with toDataURL(), so an off-screen replica of each pad is
+// kept mounted (see SignatureSnapshot) and captured when the closure is built.
+
+const DEFAULT_PAD_SIZE = { width: 300, height: 150 };
+
+const SignatureSnapshot = React.forwardRef<any, { paths: SignaturePath[]; size: { width: number; height: number } }>(
+  ({ paths, size }, ref) => (
+    <Svg ref={ref} width={size.width} height={size.height}>
+      <Rect x={0} y={0} width={size.width} height={size.height} fill="#FFFFFF" />
+      {paths.map((path, idx) => (
+        <Path
+          key={idx}
+          d={buildPathD(path.points)}
+          stroke="#1C1C1E"
+          strokeWidth={2.2}
+          fill="none"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      ))}
+    </Svg>
+  ),
+);
+
+/** Base64 PNG (no data: prefix) of a mounted snapshot Svg, or undefined if it can't be captured. */
+const snapshotToPngBase64 = (ref: React.RefObject<any>): Promise<string | undefined> =>
+  new Promise(resolve => {
+    if (!ref.current?.toDataURL) return resolve(undefined);
+    const timer = setTimeout(() => resolve(undefined), 3000);
+    ref.current.toDataURL((b64: string) => {
+      clearTimeout(timer);
+      resolve(b64 || undefined);
+    });
+  });
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+export default function TaskClosure({ navigation, route }: any) {
+  const {t} = useTranslation();
+  const { task: routeTask, elapsedSeconds = 0 } = route.params as {
+    task: Task;
+    elapsedSeconds?: number;
+  };
+
+  const [submitting, setSubmitting] = useState(false);
+
+  // Off-screen copies of the signature pads, captured to PNG on submit.
+  const customerSnapshotRef = useRef<any>(null);
+  const techSnapshotRef = useRef<any>(null);
+  const [customerPadSize, setCustomerPadSize] = useState(DEFAULT_PAD_SIZE);
+  const [techPadSize, setTechPadSize] = useState(DEFAULT_PAD_SIZE);
+
+  // ── Current location (Source: TaskClosureFragmentNew.getLastLocation() /
+  // getAddressFromLocation()) — requests location permission and resolves
+  // the technician's address as soon as the closure screen loads. The Java
+  // fragment stamps this address (plus date/time) as a caption on the
+  // before/after task photos; that caption-stamping step still needs to be
+  // wired up here once the photo-caption UI exists — for now this captures
+  // the permission + coordinates + address so that follow-up isn't blocked.
+  const [closureLocation, setClosureLocation] = useState<Coordinates | null>(null);
+  const [closureAddress, setClosureAddress] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      const granted = await requestLocationPermission();
+      if (!granted) return;
+      try {
+        const coords = await getCurrentPosition();
+        setClosureLocation(coords);
+        const address = await getAddressFromCoordinates(coords.latitude, coords.longitude);
+        setClosureAddress(address);
+      } catch (error) {
+        console.log('[TaskClosureScreen] Unable to get current location:', error);
+      }
+    })();
+  }, []);
+
+  // ── Work modes (static — see WORK_MODES above) ──
+  const [selectedWorkMode, setSelectedWorkMode] = useState<WorkModeOption | null>(null);
+
+  // ── Field photos (3 slots) ──
+  const [fieldPhotos, setFieldPhotos] = useState<(PhotoAsset | null)[]>(Array(12).fill(null));
+
+  // ── Technical notes ──
+  const [technicalNotes, setTechnicalNotes] = useState<{ text: string }[]>([]);
+  const [noteSheetVisible, setNoteSheetVisible] = useState(false);
+  const [activeNoteIndex, setActiveNoteIndex] = useState<number | null>(null);
+  const [noteInputValue, setNoteInputValue] = useState('');
+  const [noteFocused, setNoteFocused] = useState(false);
+  const [notAllowedVisible, setNotAllowedVisible] = useState(false);
+
+  // ── Device list ──
+  const [devices, setDevices] = useState<DeviceEntry[]>([]);
+  const [expandedDeviceIndex, setExpandedDeviceIndex] = useState<number | null>(null);
+  const [deviceNotAllowed, setDeviceNotAllowed] = useState(false);
+
+  // ── Attachment ──
+  const [attachment, setAttachment] = useState<AttachmentAsset | null>(null);
+
+  // Mirrors TaskClosureFragmentNew.openFilePicker(): any allowed file type, 5 MB cap.
+  const pickAttachment = async () => {
+    try {
+      const [file] = await pick({ type: ATTACHMENT_MIME_TYPES });
+      if (!file) return;
+
+      const base64 = await RNFS.readFile(file.uri, 'base64');
+      // Decoded size, as Java's isValidBase64Size() checks.
+      const bytes = Math.floor((base64.length * 3) / 4);
+      if (bytes > MAX_ATTACHMENT_BYTES) {
+        showFailureMsg(t('rn_file_size_exceeds_5_mb'));
+        return;
+      }
+
+      setAttachment({
+        uri: file.uri,
+        name: file.name ?? 'attachment',
+        type: file.type ?? 'application/octet-stream',
+        base64,
+      });
+    } catch (err: any) {
+      // Picker cancelled -> no-op; anything else is worth surfacing.
+      if (!isErrorWithCode(err) || err.code !== errorCodes.OPERATION_CANCELED) {
+        showFailureMsg(t('rn_could_not_read_the_selected_file'));
+      }
+    }
+  };
+
+  // ── Photo source modal ──
+  const [showPhotoSourceModal, setShowPhotoSourceModal] = useState(false);
+  const pendingPhotoRef = useRef<PendingPhoto | null>(null);
+
+  // ── Signature sheet ──
+  const [showSignatureSheet, setShowSignatureSheet] = useState(false);
+  const [openAccordion, setOpenAccordion] = useState<'customer' | 'tech' | null>(null);
+  const customerExpanded = openAccordion === 'customer';
+  const techExpanded = openAccordion === 'tech';
+  const toggleAccordion = (section: 'customer' | 'tech') =>
+    setOpenAccordion(prev => (prev === section ? null : section));
+
+  // ── Customer details ──
+  const [customerName, setCustomerName] = useState('');
+  const [customerNumber, setCustomerNumber] = useState('');
+  const [customerPhoto, setCustomerPhoto] = useState<PhotoAsset | null>(null);
+  const [customerSignPaths, setCustomerSignPaths] = useState<SignaturePath[]>([]);
+  const [rating, setRating] = useState(0);
+  const [ratingRemark, setRatingRemark] = useState('');
+
+  // ── Technician details ──
+  const [techPhoto, setTechPhoto] = useState<PhotoAsset | null>(null);
+  const [techSignPaths, setTechSignPaths] = useState<SignaturePath[]>([]);
+
+  // ── Satisfaction / "Happy Code" (only shown when routeTask.HappyCode is set —
+  //    cross-verified against TaskClosureFragmentNew.validate()) ──
+  const hasHappyCode = !!routeTask.HappyCode && routeTask.HappyCode !== 0;
+  const [satisfactionCode, setSatisfactionCode] = useState('');
+
+  // ─── Used Items Sheet state ───────────────────────────────────────────────
+
+  const [showUsedItemSheet, setShowUsedItemSheet] = useState(false);
+
+  const hasFSR = !!routeTask.FSRName;
+  const [showFSRSheet, setShowFSRSheet] = useState(false);
+  const [fsrLoading, setFsrLoading] = useState(false);
+  const [fsrName, setFsrName] = useState(routeTask.FSRName ?? '');
+  const [fsrCategories, setFsrCategories] = useState<FSRCategory[]>([]);
+  const [fsrStatusOptions, setFsrStatusOptions] = useState<FSRStatusOption[]>([]);
+  // checkpointId -> chosen CheckpointStatusId
+  const [fsrSelections, setFsrSelections] = useState<Record<number, number>>({});
+  const [fsrSubmitting, setFsrSubmitting] = useState(false);
+  const [fsrCompletedCount, setFsrCompletedCount] = useState(0);
+  const [activeCheckpointPicker, setActiveCheckpointPicker] = useState<number | null>(null);
+
+  // Catalogue for the ad-hoc item picker — see IssueListItem note above.
+  const [issueList, setIssueList] = useState<IssueListItem[]>([]);
+  const [issueListLoading, setIssueListLoading] = useState(false);
+
+  const [assignedSlots, setAssignedSlots] = useState<AssignedSlot[]>(() =>
+    (routeTask.MultipleItemAssigned ?? []).map(item => ({
+      ItemIssuedId: item.ItemIssuedId ?? 0,
+      ItemId:       item.ItemId ?? 0,
+      ItemName:     item.ItemName ?? '',
+      AssignedQty:  item.ItemQuantity ?? 0,
+      usedQty:      item.UsedItemQty ? String(item.UsedItemQty) : '',
+    }))
+  );
+
+  // Bottom section: ad-hoc "Add More" slots
+  const MAX_ADHOC_SLOTS = 10;
+  const [adHocSlots, setAdHocSlots] = useState<(AdHocSlot | null)[]>([]);
+  const [visibleSlotCount, setVisibleSlotCount] = useState(0);
+
+  // Searchable item picker modal
+  const [showItemPicker, setShowItemPicker] = useState(false);
+  const pendingSlotIndexRef = useRef<number>(-1);
+
+  // ─── FSR Checkpoints ────
+
+  const openFSRSheet = async () => {
+    setShowFSRSheet(true);
+    if (fsrCategories.length > 0) return;
+
+    try {
+      setFsrLoading(true);
+      const uid = await AsyncStorage.getItem('uid');
+      // Cached when fetched online (warmed on the Execution screen), so it opens offline too.
+      const { data: response } = await cachedFetch(fsrCacheKey(Number(uid), routeTask.Id as number), () =>
+        getAllchkpointCategory({
+          UserId: Number(uid),
+          TaskId: routeTask.Id,
+        }),
+      );
+      const result = response?.ResultData?.[0];
+
+      const categories = (result?.lstFSRCategories ?? []).map(cat => ({
+        CategoryId: cat.CategoryId ?? 0,
+        CategoryName: cat.CategoryName ?? '',
+        lstCheckpointDTo: (cat.lstCheckpointDTo ?? []).map(cp => ({
+          CheckpointId: cp.CheckpointId ?? 0,
+          CheckpointName: cp.CheckpointName ?? '',
+        })),
+      }));
+      const statusOptions = (result?.lstCheckpointStatusDTo ?? []).map(s => ({
+        CheckpointStatusId: s.CheckpointStatusId ?? 0,
+        CheckpointStatusName: s.CheckpointStatusName ?? '',
+      }));
+
+      // Pre-fill any previously saved selections (matches Java's
+      // lstSelectedCheckpointDTo handling in TaskClosureFragmentNew).
+      const preSelected: Record<number, number> = {};
+      (result?.lstSelectedCheckpointDTo ?? []).forEach((sel: any) => {
+        if (sel?.CheckpointId != null && sel?.CheckpointStatusId != null) {
+          preSelected[sel.CheckpointId] = sel.CheckpointStatusId;
+        }
+      });
+
+      setFsrCategories(categories);
+      setFsrStatusOptions([{ CheckpointStatusId: 0, CheckpointStatusName: 'Select' }, ...statusOptions]);
+      if (Object.keys(preSelected).length > 0) {
+        setFsrSelections(preSelected);
+        setFsrCompletedCount(Object.keys(preSelected).length);
+      }
+    } catch (err) {
+      showFailureMsg(t('rn_could_not_load_fsr_checkpoints_please_try_'));
+    } finally {
+      setFsrLoading(false);
+    }
+  };
+
+  const handleSelectCheckpointStatus = (checkpointId: number, statusId: number) => {
+    setFsrSelections(prev => {
+      const next = { ...prev };
+      if (statusId === 0) {
+        delete next[checkpointId];
+      } else {
+        next[checkpointId] = statusId;
+      }
+      setFsrCompletedCount(Object.keys(next).length);
+      return next;
+    });
+  };
+
+  const handleSubmitFSRCheckpoints = async () => {
+    const entries = Object.entries(fsrSelections);
+    if (entries.length === 0) {
+      setShowFSRSheet(false);
+      return;
+    }
+
+    try {
+      setFsrSubmitting(true);
+      const uid = await AsyncStorage.getItem('uid');
+      const userId = Number(uid);
+
+      const checkpointMeta = new Map<number, { categoryId: number }>();
+      fsrCategories.forEach(cat => {
+        (cat.lstCheckpointDTo ?? []).forEach(cp => {
+          checkpointMeta.set(cp.CheckpointId, { categoryId: cat.CategoryId });
+        });
+      });
+
+      const payload: SelectedCheckpoint[] = (entries as [string, number][]).map(([checkpointIdStr, statusId]) => {
+        const checkpointId = Number(checkpointIdStr);
+        const meta = checkpointMeta.get(checkpointId);
+        return {
+          SelectedCheckpointId: 0,
+          FSRId: routeTask.FSRId ?? 0,
+          CategoryId: meta?.categoryId ?? 0,
+          CheckpointId: checkpointId,
+          CheckpointStatusId: statusId,
+          InputTextId: 0,
+          CreatedBy: userId,
+          CreatedDate: new Date().toISOString(),
+          UpdatedBy: userId,
+          UpdatedDate: new Date().toISOString(),
+          IsActive: true,
+          TaskId: routeTask.Id,
+        };
+      });
+
+      // Java's saveAllChkPointData posts a List<ResultData> body directly
+      // (see Api.java: @Body List<SaveSelectedChkPointData.ResultData>).
+      // Java (SelectedChkPoints table): no network -> the answers are stored on the device and
+      // posted from the Sync screen, before the closure.
+      if (!(await isNetworkAvailable())) {
+        await savePendingTask(
+          { taskId: routeTask.Id as number, newTaskId: routeTask.NewTaskId ?? String(routeTask.Id), userId },
+          { checkpoints: payload },
+        );
+        setShowFSRSheet(false);
+        return;
+      }
+      await postChkpointData(payload);
+      setShowFSRSheet(false);
+    } catch (err) {
+      showFailureMsg(t('rn_could_not_save_checkpoints_please_try_agai'));
+    } finally {
+      setFsrSubmitting(false);
+    }
+  };
+
+  // ─── Open used item sheet ──
+
+  // Java UpdateUsedItems_FW.getUsedItemsIssueList(): Item/GetAssignedItemsListForFieldWorker?UserId=
+  // -> the items assigned to this fieldworker, which feed the "Item Name" picker of every
+  // ad-hoc slot (Id = ItemIssuedId, Quantity = available qty).
+  const loadIssueList = async () => {
+    if (issueListLoading || issueList.length > 0) return;
+    setIssueListLoading(true);
+    try {
+      const uid = Number(await AsyncStorage.getItem('uid')) || 0;
+      const response = await getUsedItemIssueListByUserid({ UserId: uid });
+      const rows = Array.isArray(response?.ResultData) ? response.ResultData : [];
+      setIssueList(
+        rows
+          .filter(r => !!r.Name)
+          .map(r => ({
+            Id: r.Id ?? 0,
+            ItemId: r.ItemId ?? 0,
+            Name: String(r.Name),
+            Quantity: Number(r.Quantity) || 0,
+            SalesPrice: Number(r.SalesPrice) || 0,
+          })),
+      );
+    } catch {
+      showFailureMsg(t('rn_unable_to_load_items_please_try_again'));
+    } finally {
+      setIssueListLoading(false);
+    }
+  };
+
+  const openUsedItemSheet = async () => {
+    // Updating used items talks to the server (assigned stock), so it needs a connection.
+    if (!(await isNetworkAvailable())) {
+      showFailureMsg(t('rn_internet_connection_is_required_to_update_'));
+      return;
+    }
+    setShowUsedItemSheet(true);
+    loadIssueList();
+  };
+
+  // ─── Add More slot handler ───
+
+  const handleAddMoreSlot = () => {
+    if (visibleSlotCount >= MAX_ADHOC_SLOTS) return;
+
+    // Validate the last visible slot before revealing the next one
+    if (visibleSlotCount > 0) {
+      const lastSlot = adHocSlots[visibleSlotCount - 1];
+      if (!lastSlot?.itemName || !lastSlot?.usedQty || lastSlot.usedQty === '0') {
+        showFailureMsg(t('rn_please_enter_item_name_and_quantity'));
+        return;
+      }
+      if (Number(lastSlot.usedQty) > lastSlot.avlQty) {
+        showFailureMsg(t('rn_quantity_should_not_be_greater_than_availa'));
+        setAdHocSlots(prev => {
+          const updated = [...prev];
+          if (updated[visibleSlotCount - 1]) {
+            updated[visibleSlotCount - 1] = { ...updated[visibleSlotCount - 1]!, usedQty: '' };
+          }
+          return updated;
+        });
+        return;
+      }
+    }
+
+    setAdHocSlots(prev => {
+      const updated = [...prev];
+      if (updated.length <= visibleSlotCount) updated.push(null);
+      return updated;
+    });
+    setVisibleSlotCount(c => c + 1);
+  };
+
+  // ─── Duplicate checks ──
+
+  const hasDuplicatesInAdHoc = (slots: AdHocSlot[]): boolean => {
+    const seen = new Set<number>();
+    for (const slot of slots) {
+      if (!seen.add(slot.itemId)) return true;
+    }
+    return false;
+  };
+
+  const hasDuplicatesBetween = (assigned: AssignedSlot[], adHoc: AdHocSlot[]): boolean => {
+    const assignedIds = new Set(assigned.map(a => a.ItemId).filter(Boolean));
+    return adHoc.some(s => s.itemId !== 0 && assignedIds.has(s.itemId));
+  };
+
+  // ─── UPDATE button handler ─────────────────────
+
+  const handleUsedItemUpdate = () => {
+    const filledAdHoc = adHocSlots
+      .slice(0, visibleSlotCount)
+      .filter((s): s is AdHocSlot => !!s && !!s.itemName && !!s.usedQty);
+
+    if (assignedSlots.length > 0 && filledAdHoc.length > 0) {
+      if (hasDuplicatesBetween(assignedSlots, filledAdHoc)) {
+        showFailureMsg(t('rn_duplicate_items_are_not_allowed'));
+        return;
+      }
+    } else if (filledAdHoc.length > 0) {
+      if (hasDuplicatesInAdHoc(filledAdHoc)) {
+        showFailureMsg(t('rn_duplicate_items_not_allowed'));
+        return;
+      }
+    }
+
+    const hasAssignedQty = assignedSlots.some(s => s.usedQty.trim() !== '');
+    if (!hasAssignedQty && filledAdHoc.length === 0) {
+      showFailureMsg(t('rn_please_enter_used_quantity'));
+      return;
+    }
+
+    setShowUsedItemSheet(false);
+  };
+
+  // ─── Photo helpers ────────────────────────────────────────────────────────
+
+  const openPhotoPicker = (pending: PendingPhoto) => {
+    pendingPhotoRef.current = pending;
+    Keyboard.dismiss();
+    setShowPhotoSourceModal(true);
+  };
+
+  const handlePhotoSource = async (source: 'camera' | 'gallery') => {
+    setShowPhotoSourceModal(false);
+    const pending = pendingPhotoRef.current;
+    if (!pending) return;
+    pendingPhotoRef.current = null;
+
+    const result =
+      source === 'camera'
+        ? await launchCameraWithPermission({ mediaType: 'photo', includeBase64: true, quality: 0.7 })
+        : await launchImageLibrary({ mediaType: 'photo', includeBase64: true, quality: 0.7 });
+
+    const asset = result.assets?.[0];
+    if (!asset?.uri) return;
+
+    const photo: PhotoAsset = { uri: asset.uri, base64: asset.base64 ?? undefined };
+
+    if (pending.type === 'field') {
+      setFieldPhotos(prev => {
+        const updated = [...prev];
+        updated[pending.index] = photo;
+        return updated;
+      });
+    } else if (pending.type === 'customerPhoto') {
+      setCustomerPhoto(photo);
+    } else if (pending.type === 'techPhoto') {
+      setTechPhoto(photo);
+    } else if (pending.type === 'devicePhoto') {
+      const { deviceIndex, photoKey } = pending;
+      const uriKey = `${photoKey}Uri` as 'DevicePhoto1Uri' | 'DevicePhoto2Uri' | 'DevicePhoto3Uri';
+      setDevices(prev =>
+        prev.map((d, i) =>
+          i === deviceIndex
+            ? { ...d, [photoKey]: photo.base64 ?? '', [uriKey]: photo.uri }
+            : d
+        )
+      );
+    }
+  };
+
+  // ─── Payload builder ──────────────────────────────────────────────────────
+
+  const buildFieldPhotoFields = (
+    photos: (PhotoAsset | null)[]
+  ): Pick<TaskClosureResultData, 'FieldPhoto' | 'FieldPhoto1' | 'FieldPhoto2'> => ({
+    FieldPhoto: photos[0]?.base64 || undefined,
+    FieldPhoto1: photos[1]?.base64 || undefined,
+    FieldPhoto2: photos[2]?.base64 || undefined,
+  });
+
+  // ─── Validation ───────────────────────────────────────────────────────────
+
+  const validateClosure = (): string | null => {
+    if (customerSignPaths.length === 0) {
+      return 'Please add the customer signature.';
+    }
+    if (!fieldPhotos.some(p => !!p?.base64)) {
+      return 'Please add at least one field photo.';
+    }
+    if (rating === 0) {
+      return 'Please rate the service.';
+    }
+    if (!selectedWorkMode) {
+      return 'Please select a Work Mode before continuing.';
+    }
+    if (hasHappyCode) {
+      if (!satisfactionCode.trim()) {
+        return 'Please Enter Satisfaction Code!!';
+      }
+      if (Number(satisfactionCode) !== routeTask.HappyCode) {
+        return 'Please Enter Valid Satisfaction Code!!';
+      }
+    }
+    // Matches Java's addDeviceListToTaskClosure(): every device row the
+    // technician added must have a name, a model number, and at least one
+    // photo before the closure can submit.
+    for (const device of devices) {
+      const name = device.DeviceName?.trim() ?? '';
+      const model = device.ModelNumber?.trim() ?? '';
+      const hasPhoto = !!(device.DevicePhoto1 || device.DevicePhoto2 || device.DevicePhoto3);
+      if (!name) return 'Please Enter Device Name';
+      if (!model) return 'Please Enter Model No';
+      if (!hasPhoto) return 'Please add at least one device photo';
+    }
+    return null;
+  };
+
+  // ─── Submit ───────────────────────────────────────────────────────────────
+
+  const handleContinue = async () => {
+    const validationError = validateClosure();
+    if (validationError) {
+      showFailureMsg(validationError || 'Required');
+      return;
+    }
+    try {
+      setSubmitting(true);
+      const freshUid = await AsyncStorage.getItem('uid');
+      if (!freshUid) {
+        showFailureMsg(t('rn_user_session_not_found_please_log_in_again'));
+        return;
+      }
+      // Java (getCustomFieldData -> isCustomLabelRequired): every required Task Input
+      // field must have a value before the closure can continue.
+      // Offline, the answer saved the last time the fields were read online is used, so a task
+      // with an empty mandatory Task Input cannot be closed without a connection (Task Input
+      // itself needs one).
+      try {
+        const { data: customFields, fromCache } = await cachedFetch(
+          customFieldsCacheKey(Number(freshUid), routeTask.Id as number),
+          () => getCustomFieldData({ UserId: Number(freshUid), TaskId: routeTask.Id }),
+        );
+        const missingRequired = (customFields.ResultData ?? []).some(
+          f => f.IsRequired && (f.UserValue == null || String(f.UserValue).trim() === ''),
+        );
+        if (missingRequired) {
+          showFailureMsg(
+            fromCache && !(await isNetworkAvailable())
+              ? tr('Connect to the internet to add the mandatory Task Input to proceed !!')
+              : tr('Please Add all the mandatory Task Input to proceed !!'),
+          );
+          return;
+        }
+      } catch {
+        // Nothing saved for this task (e.g. created offline) and no connection: there is
+        // nothing to verify against, so the closure carries on and is stored for sync.
+        if (await isNetworkAvailable()) {
+          showFailureMsg(t('rn_could_not_verify_the_required_task_inputs_'));
+          return;
+        }
+      }
+
+      const now = new Date().toISOString();
+
+      const customerSignatureImage = customerSignPaths.length > 0
+        ? await snapshotToPngBase64(customerSnapshotRef)
+        : undefined;
+      const techSignatureImage = techSignPaths.length > 0
+        ? await snapshotToPngBase64(techSnapshotRef)
+        : undefined;
+
+      const isRateMode =
+        routeTask.TaskState === TASK_STATE.ENDED_NO_PAYMENT &&
+        (routeTask.PaymentMode ?? '').toLowerCase() === 'rate' &&
+        routeTask.PaymentModeId === PAYMENT_MODE_RATE_ID;
+
+      const filledAdHoc = adHocSlots
+        .slice(0, visibleSlotCount)
+        .filter((s): s is AdHocSlot => !!s && !!s.usedQty);
+
+      const usedItemDetailsDto: TaskClosureUsedItemDetailsDto[] = [
+        ...assignedSlots
+          .filter(s => s.usedQty.trim() !== '')
+          .map(s => ({
+            Id:           0,
+            ItemId:       s.ItemId,
+            ItemIssuedId: s.ItemIssuedId,
+            TaskId:       routeTask.Id,
+            AvlQty:       0,
+            AssignedQty:  s.AssignedQty,
+            UsedQty:      Number(s.usedQty),
+            UserId:       Number(freshUid),
+            CreatedBy:    Number(freshUid),
+            CreatedDate:  now,
+            UpdateBy:     Number(freshUid),
+            UpdatedDate:  now,
+            Notes:        '',
+          })),
+        ...filledAdHoc.map(s => ({
+          Id:           0,
+          ItemId:       s.itemId,
+          ItemIssuedId: s.itemIssuedId,
+          TaskId:       routeTask.Id,
+          // Java rebuildUsedItemDetailsForPost: add-more items go out with AvlQty 0 and the used
+          // quantity as the assigned quantity.
+          AvlQty:       0,
+          AssignedQty:  Number(s.usedQty),
+          UsedQty:      Number(s.usedQty),
+          UserId:       Number(freshUid),
+          CreatedBy:    Number(freshUid),
+          CreatedDate:  now,
+          UpdateBy:     Number(freshUid),
+          UpdatedDate:  now,
+          Notes:        '',
+        })),
+      ];
+
+      const technicalNotedto: TaskClosureTechnicalNotedto[] = technicalNotes.map(note => ({
+        Id: 0,
+        TechnicalNote1: note.text,
+        TaskClosureDetailsId: 0,
+        UserId: String(freshUid),
+        CreatedBy: String(freshUid),
+        CreatedDate: now,
+        UpdatedBy: String(freshUid),
+        UpdatedDate: now,
+        isSyncDone: '0',
+      }));
+
+      const deviceInfoList: TaskClosureDeviceInfoList[] = devices.map(device => ({
+        Id: 0,
+        DeviceName:    device.DeviceName    ?? '',
+        ModelNumber:   device.ModelNumber   ?? '',
+        DevicePhoto1:  device.DevicePhoto1  ?? '',
+        DevicePhoto2:  device.DevicePhoto2  ?? '',
+        DevicePhoto3:  device.DevicePhoto3  ?? '',
+        DeviceReading: device.DeviceReading ?? 0,
+        TaskClosureDetailsId: 0,
+        UserId:      String(freshUid),
+        CreatedBy:   String(freshUid),
+        CreatedDate: now,
+        UpdatedBy:   String(freshUid),
+        UpdatedDate: now,
+        isSyncDone: '0',
+      }));
+
+      const payload: TaskClosureResultData = {
+        Id: 0,
+        UserId: Number(freshUid),
+        TaskId: routeTask.Id,
+        TaskState: isRateMode ? TASK_STATE.ENDED_NO_PAYMENT : TASK_STATE.PAYMENT_RECEIVED,
+        TaskStatus: isRateMode ? TASK_STATUS.ON_GOING : TASK_STATUS.COMPLETED,
+        CreatedBy: String(freshUid),
+        CreatedDate: now,
+        UpdatedBy: String(freshUid),
+        UpdatedDate: now,
+
+        WorkModeId: selectedWorkMode!.Id,
+        WorkModeType: selectedWorkMode!.WorkModeType,
+
+        ...buildFieldPhotoFields(fieldPhotos),
+        // Java also posts every field photo as AfterImages[] (the source for the
+        // new before/after image API), not just FieldPhoto/1/2.
+        AfterImages: buildImagesPayload(fieldPhotos.map(p => p?.base64)),
+
+        TechnicalNotedto: technicalNotedto,
+
+        DeviceInfoList: deviceInfoList,
+
+        SignedBy: customerName || undefined,
+        MobileNo: customerNumber ? Number(customerNumber) : 0,
+        ...(customerPhoto?.base64 && { CustomerImage: customerPhoto.base64 }),
+        // Java always sends a customer signature; when none was captured it posts a
+        // 1x1 transparent PNG so the server field is never empty.
+        CustomerSignatureImage: customerSignatureImage ?? EMPTY_SIGNATURE_PNG_BASE64,
+
+        ...(techPhoto?.base64 && { TechImage: techPhoto.base64 }),
+        ...(techSignatureImage && { TechSignatureImage: techSignatureImage }),
+
+        RatingBar: rating,
+        RatingBarId: 0,
+        ...(ratingRemark.trim() && { RatingRemark: ratingRemark.trim() }),
+
+        // Java: name without extension + "." + extension of the picked file.
+        ...(attachment && {
+          Tsk_Doc_Base64: attachment.base64,
+          Tsk_Doc_Name: attachment.name.replace(/\.[^.]+$/, ''),
+          Tsk_Doc_Extension: attachment.name.includes('.')
+            ? `.${attachment.name.split('.').pop()}`
+            : '',
+        }),
+
+        SelectedCheckpointList: [],
+        CustomeFieldDTO: [],
+        Task_Excess_Amount_Dtls: [],
+        UsedItemDetailsDto: usedItemDetailsDto,
+        MultipleItemAssigned: [],
+      };
+
+      navigation.navigate('TaskSummary', {
+        returnTo: { name: 'TaskClosure', params: route.params },
+        task: routeTask,
+        elapsedSeconds,
+        payload,
+        // Java UpdateUsedItems_FW -> ADD_MORE_USED_ITEM: ItemId = the item, ItemIssuedId = the
+        // issue-list record id, quantity = used qty. Posted to Task/UpdateReIssuedItems on submit.
+        addMoreItems: filledAdHoc.map(s => ({
+          ItemId: s.itemId,
+          ItemIssuedId: s.itemIssuedId,
+          ItemName: s.itemName,
+          SalesPrice: s.salesPrice,
+          ItemQuantity: Number(s.usedQty),
+          UsedItemQty: Number(s.usedQty),
+        })),
+        preview: {
+          workModeType: selectedWorkMode!.WorkModeType,
+          customerName,
+          customerNumber,
+          rating,
+          ratingRemark,
+          // Java summary: assigned items with assigned/used qty and price, followed by
+          // items added during the task (used qty shown in both columns).
+          items: [
+            ...assignedSlots.map(s => {
+              const used = Number(s.usedQty) || 0;
+              const sales =
+                routeTask.MultipleItemAssigned?.find(
+                  a => a.ItemId === s.ItemId && a.ItemIssuedId === s.ItemIssuedId,
+                )?.SalesPrice ?? 0;
+              return { name: s.ItemName, assignedQty: s.AssignedQty, usedQty: used, price: used * sales };
+            }),
+            ...filledAdHoc.map(s => {
+              const used = Number(s.usedQty) || 0;
+              return { name: s.itemName, assignedQty: used, usedQty: used, price: used * s.salesPrice };
+            }),
+          ],
+          fieldPhotoUris: fieldPhotos.filter((p): p is PhotoAsset => !!p?.uri).map(p => p.uri),
+          customerPhotoUri: customerPhoto?.uri,
+          techPhotoUri: techPhoto?.uri,
+          customerSignPaths,
+          techSignPaths,
+        },
+      });
+    } catch (err: any) {
+      showFailureMsg(err?.message || 'Something went wrong building the summary.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // ─── Render ───────────────────────────────────────────────────────────────
+
+  return (
+    <KeyboardAvoidingView
+      style={styles.root}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
+      <View style={styles.redBg} />
+
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.scrollContent}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+      >
+
+        {/* ── FIELD PHOTO ─────────────────────────────────────────────── */}
+        <View style={[styles.card, { marginTop: 0 }]}>
+          <Text style={styles.cardTitle}>{t('field_photo')}</Text>
+          <Text style={styles.cardSubtitle}>{t('where_the_task_is_performed')}</Text>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.fieldPhotoRow}
+          >
+            {Array.from({ length: 12 }, (_, i) => i).map(i => (
+              <Pressable
+                key={`field-photo-${i}`}
+                style={styles.photoSlot}
+                onPress={() => openPhotoPicker({ type: 'field', index: i })}
+              >
+                {fieldPhotos[i]?.uri ? (
+                  <>
+                    <Image source={{ uri: fieldPhotos[i]!.uri }} style={styles.photoThumb} />
+                    <Pressable
+                      style={styles.photoRemoveBtn}
+                      onPress={() =>
+                        setFieldPhotos(prev => {
+                          const updated = [...prev];
+                          updated[i] = null;
+                          return updated;
+                        })
+                      }
+                      hitSlop={6}
+                    >
+                      <Ionicons name="close" size={sp(15)} color="#fff" />
+                    </Pressable>
+                  </>
+                ) : (
+                  <Ionicons name="camera-outline" size={ms(64)} color={COLORS.lightGray} />
+                )}
+              </Pressable>
+            ))}
+          </ScrollView>
+        </View>
+
+        {/* ── WORK MODE ───────────────────────────────────────────────── */}
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>{t('work_mode_without_colon')}</Text>
+          <View style={styles.workModeRow}>
+            {WORK_MODES.map(mode => (
+              <Pressable
+                key={`work-mode-${mode.Id}`}
+                style={styles.radioItem}
+                onPress={() => {
+                  Keyboard.dismiss();
+                  setSelectedWorkMode(mode);
+                }}
+              >
+                <View
+                  style={[
+                    styles.radioOuter,
+                    selectedWorkMode?.Id === mode.Id && styles.radioOuterActive,
+                  ]}
+                >
+                  {selectedWorkMode?.Id === mode.Id && <View style={styles.radioInner} />}
+                </View>
+                <Text style={styles.radioLabel}>{mode.WorkModeType}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+
+        {/* ── TECHNICAL NOTES ─────────────────────────────────────────── */}
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>{t('technical_note')}</Text>
+          <Pressable
+            style={styles.addRow}
+            onPress={() => {
+              const hasEmpty = technicalNotes.some(n => !n.text.trim());
+              if (hasEmpty) {
+                setNotAllowedVisible(true);
+                setTimeout(() => setNotAllowedVisible(false), 2000);
+                return;
+              }
+              setTechnicalNotes(prev => [...prev, { text: '' }]);
+            }}
+          >
+            <Text style={styles.addRowPlaceholder}>{t('add_new_notes')}</Text>
+            <Text style={styles.plusBtn}>+</Text>
+          </Pressable>
+          {notAllowedVisible && (
+            <Text style={styles.notAllowedText}>
+              {t('rn_please_fill_the_existing_note_before_addin')}
+            </Text>
+          )}
+          {technicalNotes.map((note, idx) => (
+            <Pressable
+              key={`note-${idx}`}
+              style={styles.noteChip}
+              onPress={() => {
+                setActiveNoteIndex(idx);
+                setNoteInputValue(note.text);
+                setNoteSheetVisible(true);
+              }}
+            >
+              <Text style={styles.noteChipIndex}>{idx + 1}</Text>
+              <Text
+                style={[styles.noteChipText, !note.text && styles.noteChipPlaceholder]}
+                numberOfLines={1}
+              >
+                {note.text || 'Click here to add note details'}
+              </Text>
+              <Pressable
+                hitSlop={8}
+                onPress={() => setTechnicalNotes(prev => prev.filter((_, i) => i !== idx))}
+              >
+                <Ionicons name="close" size={sp(25)} color={COLORS.primary} />
+              </Pressable>
+            </Pressable>
+          ))}
+        </View>
+
+        {/* Technical Notes Bottom Sheet */}
+        <Modal
+          visible={noteSheetVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setNoteSheetVisible(false)}
+        >
+          <View style={styles.sheetOverlay}>
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+              style={styles.sheetContainer}
+            >
+              <View style={styles.sheetContent}>
+                <Text style={styles.sheetTitle}>{t('technical_note')}</Text>
+                <View style={styles.sheetField}>
+                  {(noteFocused || noteInputValue.length > 0) && (
+                    <Text style={styles.sheetFieldLabel}>{t('click_here_to_add_note')}</Text>
+                  )}
+                  <TextInput
+                    value={noteInputValue}
+                    onChangeText={setNoteInputValue}
+                    onFocus={() => setNoteFocused(true)}
+                    onBlur={() => setNoteFocused(false)}
+                    placeholder={noteFocused ? undefined : tr('Click here to add note')}
+                    placeholderTextColor={COLORS.lightGray}
+                    style={styles.sheetTextArea}
+                    multiline
+                    autoFocus
+                    maxLength={400}
+                    textAlignVertical="top"
+                  />
+                </View>
+                <Pressable
+                  style={styles.sheetSaveBtn}
+                  onPress={() => {
+                    if (activeNoteIndex !== null) {
+                      setTechnicalNotes(prev =>
+                        prev.map((n, i) =>
+                          i === activeNoteIndex ? { text: noteInputValue.trim() } : n
+                        )
+                      );
+                    }
+                    setNoteInputValue('');
+                    setActiveNoteIndex(null);
+                    setNoteSheetVisible(false);
+                  }}
+                >
+                  <Text style={styles.sheetSaveBtnText}>{t('save').toUpperCase()}</Text>
+                </Pressable>
+                <Pressable onPress={() => setNoteSheetVisible(false)}>
+                  <Text style={styles.sheetCancelText}>{t('cancel')}</Text>
+                </Pressable>
+              </View>
+            </KeyboardAvoidingView>
+          </View>
+        </Modal>
+
+        {/* ── DEVICE LIST ─────────────────────────────────────────────── */}
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>{t('device_list')}</Text>
+          <Pressable
+            style={styles.addRow}
+            onPress={() => {
+              const hasEmpty = devices.some(
+                d => !d.DeviceName?.trim() && !d.ModelNumber?.trim() && !d.DeviceReading
+              );
+              if (hasEmpty) {
+                setDeviceNotAllowed(true);
+                setTimeout(() => setDeviceNotAllowed(false), 2000);
+                return;
+              }
+              const newIndex = devices.length;
+              setDevices(prev => [...prev, {}]);
+              setExpandedDeviceIndex(newIndex);
+            }}
+          >
+            <Text style={styles.addRowPlaceholder}>{t('add_new_device')}</Text>
+            <Text style={styles.plusBtn}>+</Text>
+          </Pressable>
+          {deviceNotAllowed && (
+            <Text style={styles.notAllowedText}>
+              {t('rn_please_fill_the_existing_device_before_add')}
+            </Text>
+          )}
+          {devices.map((device, idx) => {
+            const isExpanded = expandedDeviceIndex === idx;
+            return (
+              <View key={`device-${idx}`} style={styles.deviceChipWrapper}>
+                <Pressable
+                  style={styles.deviceHeader}
+                  onPress={() => setExpandedDeviceIndex(isExpanded ? null : idx)}
+                >
+                  <Text style={styles.deviceIndex}>{idx + 1}</Text>
+                  <Text
+                    style={[styles.deviceHeaderText, !device.DeviceName && styles.noteChipPlaceholder]}
+                    numberOfLines={1}
+                  >
+                    {isExpanded
+                      ? (device.DeviceName || 'Click here to close')
+                      : (device.DeviceName || 'Click here to add device details')}
+                  </Text>
+                  <Pressable
+                    hitSlop={8}
+                    onPress={() => {
+                      setDevices(prev => prev.filter((_, i) => i !== idx));
+                      if (expandedDeviceIndex === idx) setExpandedDeviceIndex(null);
+                    }}
+                  >
+                    <Ionicons name="close" size={ms(25)} color={COLORS.primary} />
+                  </Pressable>
+                </Pressable>
+
+                {isExpanded && (
+                  <View style={styles.deviceForm}>
+                    <TextInput
+                      value={device.DeviceName || ''}
+                      onChangeText={val =>
+                        setDevices(prev =>
+                          prev.map((d, i) => (i === idx ? { ...d, DeviceName: val } : d))
+                        )
+                      }
+                      placeholder={t('device')}
+                      placeholderTextColor="#ABABAB"
+                      style={styles.deviceInput}
+                    />
+                    <TextInput
+                      value={device.ModelNumber || ''}
+                      onChangeText={val =>
+                        setDevices(prev =>
+                          prev.map((d, i) => (i === idx ? { ...d, ModelNumber: val } : d))
+                        )
+                      }
+                      placeholder={t('company_model')}
+                      placeholderTextColor="#ABABAB"
+                      style={styles.deviceInput}
+                    />
+                    <DecimalInput integer
+                      value={
+                        device.DeviceReadingText ??
+                        (device.DeviceReading ? String(device.DeviceReading) : '')
+                      }
+                      onChangeText={val => {
+                        // Device reading is a whole number: digits only.
+                        const text = val.replace(/\D/g, '');
+                        setDevices(prev =>
+                          prev.map((d, i) =>
+                            i === idx
+                              ? { ...d, DeviceReadingText: text, DeviceReading: Number(text) || 0 }
+                              : d
+                          )
+                        );
+                      }}
+                      label={t('device_reading')}
+                      placeholderTextColor="#ABABAB"
+                      style={styles.deviceInput}
+                    />
+                    <View style={styles.devicePhotoRow}>
+                      {(['DevicePhoto1', 'DevicePhoto2', 'DevicePhoto3'] as const).map(
+                        (photoKey, pIdx) => (
+                          <View key={photoKey} style={styles.devicePhotoSlot}>
+                            <Pressable
+                              style={styles.devicePhotoRemove}
+                              onPress={() => {
+                                const uriKey = `${photoKey}Uri` as
+                                  | 'DevicePhoto1Uri'
+                                  | 'DevicePhoto2Uri'
+                                  | 'DevicePhoto3Uri';
+                                setDevices(prev =>
+                                  prev.map((d, i) =>
+                                    i === idx ? { ...d, [photoKey]: '', [uriKey]: undefined } : d
+                                  )
+                                );
+                              }}
+                              hitSlop={6}
+                            >
+                              <Ionicons name="close" size={ms(11)} color="#EF4444" />
+                            </Pressable>
+                            <Pressable
+                              style={styles.photoInner}
+                              onPress={() =>
+                                openPhotoPicker({ type: 'devicePhoto', deviceIndex: idx, photoKey })
+                              }
+                            >
+                              {device[
+                                `${photoKey}Uri` as
+                                  | 'DevicePhoto1Uri'
+                                  | 'DevicePhoto2Uri'
+                                  | 'DevicePhoto3Uri'
+                              ] ? (
+                                <Image
+                                  source={{
+                                    uri: device[
+                                      `${photoKey}Uri` as
+                                        | 'DevicePhoto1Uri'
+                                        | 'DevicePhoto2Uri'
+                                        | 'DevicePhoto3Uri'
+                                    ],
+                                  }}
+                                  style={styles.photoPreview}
+                                  resizeMode="cover"
+                                />
+                              ) : pIdx === 0 ? (
+                                <Ionicons name="camera-outline" size={ms(64)} color={COLORS.lightGray} style={{ opacity: 0.7 }} />
+                              ) : (
+                                <Ionicons name="add-circle-outline" size={ms(34)} color={COLORS.lightGray} style={{ opacity: 0.7 }} />
+                              )}
+                            </Pressable>
+                          </View>
+                        )
+                      )}
+                    </View>
+                  </View>
+                )}
+              </View>
+            );
+          })}
+        </View>
+
+        {/* ── ACTION TILES ────────────────────────────────────────────── */}
+        <View style={styles.tilesRow}>
+          <Pressable style={styles.tile} onPress={openUsedItemSheet}>
+            <Text style={styles.tileTitle}>{t('rn_update_used_item')}</Text>
+            <Text style={styles.tileSub}>{t('rn_click_here_to_add_update')}</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.tile, { backgroundColor: '#EEF0F3' }]}
+            onPress={async () => {
+              // Task Input is saved straight to the server, so it needs a connection.
+              if (!(await isNetworkAvailable())) {
+                showFailureMsg(t('rn_internet_connection_is_required_to_add_tas'));
+                return;
+              }
+              navigation.navigate('TaskInput', { routeTask, returnTo: { name: 'TaskClosure', params: route.params } });
+            }}
+          >
+            <Text style={styles.tileTitle}>{t('rn_add_task_input')}</Text>
+            <Text style={styles.tileSub}>{t('rn_click_here_to_add_task_input')}</Text>
+          </Pressable>
+          <Pressable
+            style={styles.tile}
+            onPress={() => navigation.navigate('QRScanHistory', { task: routeTask, returnTo: { name: 'TaskClosure', params: route.params } })}
+          >
+            <Text style={styles.tileTitle}>{t('rn_scan_qr_2')}</Text>
+            <Text style={styles.tileSub}>{t('rn_click_here_to_scan_qr')}</Text>
+          </Pressable>
+        </View>
+
+        {/* ──────────────── CHECKPOINTS (FSR) ──────────────────── */}
+        {hasFSR && (
+          <Pressable style={styles.naCard} onPress={openFSRSheet}>
+            <Text style={styles.naTitle}>{routeTask.FSRName}</Text>
+            <Text style={styles.naSub}>
+              {fsrCompletedCount > 0
+                ? `${fsrCompletedCount} checkpoint${fsrCompletedCount === 1 ? '' : 's'} filled — tap to review`
+                : tr('Click here for filling checkpoints')}
+            </Text>
+          </Pressable>
+        )}
+
+        {/* ── SIGNATURE & RATING ──────────────────────────────────────── */}
+        <View style={[styles.card, styles.boxCard, { backgroundColor: '#FFF0F3' }]}>
+          <Text style={styles.cardTitle}>{t('signature_and_rating')}</Text>
+          <Pressable
+            style={styles.signatureArea}
+            onPress={() => setShowSignatureSheet(true)}
+          >
+            {customerSignPaths.length > 0 ? (
+              <Svg width="100%" height="100%" style={StyleSheet.absoluteFill}>
+                {customerSignPaths.map((path, idx) => (
+                  <Path
+                    key={idx}
+                    d={buildPathD(path.points)}
+                    stroke="#1C1C1E"
+                    strokeWidth={2.2}
+                    fill="none"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                ))}
+              </Svg>
+            ) : (
+              <Text style={styles.signaturePlaceholder}>{t('click_below_customer_signature')}</Text>
+            )}
+          </Pressable>
+        </View>
+
+        {/* ── SATISFACTION CODE (only when task has a HappyCode) ─────── */}
+        {hasHappyCode && (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>{t('enter_satisfaction_code')}</Text>
+            <TextInput
+              value={satisfactionCode}
+              onChangeText={setSatisfactionCode}
+              placeholder={t('rn_enter_satisfaction_code')}
+              placeholderTextColor="#ABABAB"
+              keyboardType="numeric"
+              inputAccessoryViewID={numpadAccessoryId("numeric")}
+              style={styles.deviceInput}
+            />
+          </View>
+        )}
+
+        {/* ── UPLOAD ATTACHMENT ───────────────────────────────────────── */}
+        <View style={[styles.card, styles.boxCard, styles.boxGrey]}>
+          <Text style={styles.cardTitle}>{t('attach_file')}</Text>
+          <Pressable
+            style={styles.dashedBox}
+            onPress={pickAttachment}
+          >
+            {attachment ? (
+              <View style={styles.dashedInner}>
+                <Ionicons name="document-outline" size={sp(24)} color={COLORS.primary} />
+                <Text style={styles.attachLabel} numberOfLines={1}>{attachment.name}</Text>
+              </View>
+            ) : (
+              <View style={styles.dashedInner}>
+                <Ionicons name="share-outline" size={ms(26)} color={COLORS.primary} />
+                <Text style={styles.attachLabel}>{t('attachment')}</Text>
+              </View>
+            )}
+          </Pressable>
+        </View>
+
+        {/* ── REQUEST ITEMS BTN ───────────────────────────────────────── */}
+        <Pressable
+          style={styles.requestBtn}
+          onPress={() => navigation.navigate('ItemRequest', { routeTask, returnTo: { name: 'TaskClosure', params: route.params } })}
+        >
+          <Text style={styles.requestBtnText}>{t('request_items').toUpperCase()}</Text>
+        </Pressable>
+
+        {/* ── CONTINUE BTN ────────────────────────────────────────────── */}
+        <Pressable
+          style={[styles.continueBtn, submitting && { opacity: 0.6 }]}
+          onPress={handleContinue}
+          disabled={submitting}
+        >
+          {submitting ? (
+            <ActivityIndicator color="#fff" />
+          ) : (
+            <Text style={styles.continueBtnText}>{t('continue_title').toUpperCase()}</Text>
+          )}
+        </Pressable>
+
+      </ScrollView>
+
+      {/* ══════════════════════════════════════════════════════════════════
+          SIGNATURE MODAL
+      ══════════════════════════════════════════════════════════════════ */}
+      <Modal
+        visible={showSignatureSheet}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowSignatureSheet(false)}
+      >
+        <View style={styles.bottomSheetOverlay}>
+          <View style={styles.signatureSheet}>
+            <Text style={styles.signatureSheetTitle}>{t('signature_and_rating')}</Text>
+
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={{ paddingBottom: vs(16) }}
+            >
+              {/* ADD CUSTOMER DETAILS */}
+              <Pressable
+                style={[
+                  styles.signatureDropdown,
+                  customerExpanded && sigModalStyles.dropdownActive,
+                ]}
+                onPress={() => toggleAccordion('customer')}
+              >
+                <Text style={styles.signatureDropdownText}>{t('rn_add_customer_details')}</Text>
+                <Ionicons name="caret-down" size={ms(18)} color={COLORS.primary} style={styles.signatureCaret} />
+              </Pressable>
+
+              {customerExpanded && (
+                <View style={sigModalStyles.expandedSection}>
+                  <View style={sigModalStyles.fieldsAndPhoto}>
+                    <View style={sigModalStyles.fieldsCol}>
+                      <TextInput
+                        value={customerName}
+                        onChangeText={setCustomerName}
+                        placeholder={t('customer_name')}
+                        placeholderTextColor="#a6a6a6"
+                        style={sigModalStyles.roundedInput}
+                      />
+                      <TextInput
+                        value={customerNumber}
+                        onChangeText={setCustomerNumber}
+                        placeholder={t('customer_number')}
+                        placeholderTextColor="#a6a6a6"
+                        keyboardType="phone-pad"
+                        inputAccessoryViewID={numpadAccessoryId("phone-pad")}
+                        style={[sigModalStyles.roundedInput, { marginTop: vs(20) }]}
+                      />
+                    </View>
+                    <Pressable
+                      style={sigModalStyles.photoSlot}
+                      onPress={() => openPhotoPicker({ type: 'customerPhoto' })}
+                    >
+                      {customerPhoto?.uri ? (
+                        <>
+                          <Image source={{ uri: customerPhoto.uri }} style={sigModalStyles.photoThumb} />
+                          <Pressable
+                            style={sigModalStyles.photoRemoveBtn}
+                            onPress={() => setCustomerPhoto(null)}
+                            hitSlop={6}
+                          >
+                            <Ionicons name="close" size={sp(15)} color="#fff" />
+                          </Pressable>
+                        </>
+                      ) : (
+                        <Ionicons name="camera-outline" size={ms(56)} color={COLORS.lightGray} />
+                      )}
+                    </Pressable>
+                  </View>
+
+                  <View style={sigModalStyles.signatureRow}>
+                    <Text style={sigModalStyles.signatureLabel}>{t('customer_signature')}</Text>
+                    <Pressable onPress={() => setCustomerSignPaths([])}>
+                      <Text style={sigModalStyles.clearText}>{t('clear').toUpperCase()}</Text>
+                    </Pressable>
+                  </View>
+                  <SignaturePad
+                    paths={customerSignPaths}
+                    onPathsChange={setCustomerSignPaths}
+                    onSizeChange={setCustomerPadSize}
+                    height={100}
+                  />
+
+                  <StarRating
+                    value={rating}
+                    onChange={v => {
+                      setRating(v);
+                      if (v > 3) setRatingRemark('');
+                    }}
+                  />
+
+                  {rating > 0 && rating <= 3 && (
+                    <View style={sigModalStyles.remarkContainer}>
+                      <TextInput
+                        value={ratingRemark}
+                        onChangeText={setRatingRemark}
+                        placeholder={t('rn_enter_remark_here')}
+                        placeholderTextColor="#ABABAB"
+                        style={sigModalStyles.roundedInput}
+                        multiline
+                        numberOfLines={3}
+                        textAlignVertical="top"
+                      />
+                    </View>
+                  )}
+                </View>
+              )}
+
+              {/* ADD TECHNICIAN DETAILS */}
+              <Pressable
+                style={[
+                  styles.signatureDropdown,
+                  { marginTop: ms(15), marginBottom: ms(10) },
+                  techExpanded && sigModalStyles.dropdownActive,
+                ]}
+                onPress={() => toggleAccordion('tech')}
+              >
+                <Text style={styles.signatureDropdownText}>{t('rn_add_technician_details')}</Text>
+                <Ionicons name="caret-down" size={ms(18)} color={COLORS.primary} style={styles.signatureCaret} />
+              </Pressable>
+
+              {techExpanded && (
+                <View style={sigModalStyles.expandedSection}>
+                  <Text style={sigModalStyles.techInfoLabel}>{t('rn_tech_info')}</Text>
+                  <Pressable
+                    style={sigModalStyles.techPhotoSlot}
+                    onPress={() => openPhotoPicker({ type: 'techPhoto' })}
+                  >
+                    {techPhoto?.uri ? (
+                      <>
+                        <Image source={{ uri: techPhoto.uri }} style={sigModalStyles.techPhotoThumb} />
+                        <Pressable
+                          style={sigModalStyles.photoRemoveBtn}
+                          onPress={() => setTechPhoto(null)}
+                          hitSlop={6}
+                        >
+                          <Ionicons name="close" size={sp(15)} color="#fff" />
+                        </Pressable>
+                      </>
+                    ) : (
+                      <Ionicons name="camera-outline" size={ms(56)} color={COLORS.lightGray} />
+                    )}
+                  </Pressable>
+
+                  <View style={sigModalStyles.signatureRow}>
+                    <Text style={sigModalStyles.signatureLabel}>{t('customer_signature')}</Text>
+                    <Pressable onPress={() => setTechSignPaths([])}>
+                      <Text style={sigModalStyles.clearText}>{t('clear').toUpperCase()}</Text>
+                    </Pressable>
+                  </View>
+                  <SignaturePad
+                    paths={techSignPaths}
+                    onPathsChange={setTechSignPaths}
+                    onSizeChange={setTechPadSize}
+                    height={100}
+                  />
+                </View>
+              )}
+            </ScrollView>
+
+            <Pressable
+              style={styles.signatureSaveBtn}
+              onPress={() => setShowSignatureSheet(false)}
+            >
+              <Text style={styles.signatureSaveText}>{t('save').toUpperCase()}</Text>
+            </Pressable>
+            <Pressable onPress={() => setShowSignatureSheet(false)}>
+              <Text style={styles.signatureCancelText}>{t('cancel')}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      {/* ══════════════════════════════════════════════════════════════════
+          PHOTO SOURCE MODAL
+      ══════════════════════════════════════════════════════════════════ */}
+      <ImageSourceDialog
+        visible={showPhotoSourceModal}
+        onCamera={() => handlePhotoSource('camera')}
+        onGallery={() => handlePhotoSource('gallery')}
+        onClose={() => setShowPhotoSourceModal(false)}
+      />
+
+      {/* ══════════════════════════════════════════════════════════════════
+          UPDATE USED ITEM SHEET
+      ══════════════════════════════════════════════════════════════════ */}
+      <Modal
+        visible={showUsedItemSheet}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowUsedItemSheet(false)}
+      >
+        <View style={styles.sheetOverlay}>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={usedItemStyles.sheet}
+          >
+            {/* Dark header */}
+            <View style={usedItemStyles.header}>
+              <Text style={usedItemStyles.headerTitle}>{t('update_used_items')}</Text>
+              <Pressable onPress={() => setShowUsedItemSheet(false)} hitSlop={10}>
+                <Ionicons name="close" size={ms(30)} color={COLORS.white} />
+              </Pressable>
+            </View>
+
+            <ScrollView
+              contentContainerStyle={usedItemStyles.listContent}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              {issueListLoading ? (
+                <ActivityIndicator size="large" color={COLORS.primary} style={{ marginTop: vs(30) }} />
+              ) : (
+                <>
+                  {/* ── Assigned items (Task.MultipleItemAssigned) ── */}
+                  {assignedSlots.map((slot, idx) => (
+                    <View key={`assigned-${idx}`} style={usedItemStyles.itemRow}>
+                      <Text style={usedItemStyles.itemName} numberOfLines={2}>
+                        {idx + 1}. {slot.ItemName}
+                      </Text>
+                      <View style={usedItemStyles.assignedPlain}>
+                        <Text style={usedItemStyles.assignedQtyText}>{slot.AssignedQty}</Text>
+                      </View>
+                      <DecimalInput integer
+                        value={slot.usedQty}
+                        onChangeText={val => {
+                          const num = Number(val);
+                          if (val !== '' && (isNaN(num) || num > slot.AssignedQty)) return;
+                          setAssignedSlots(prev =>
+                            prev.map((s, i) => (i === idx ? { ...s, usedQty: val } : s))
+                          );
+                        }}
+                        label={t('used_qty')}
+                        placeholderTextColor="#ABABAB"
+                        style={usedItemStyles.usedQtyInput}
+                      />
+                    </View>
+                  ))}
+
+                  {assignedSlots.length === 0 && visibleSlotCount === 0 && (
+                    <Text style={usedItemStyles.emptyText}>
+                      {t('rn_no_items_assigned_to_this_task')}
+                    </Text>
+                  )}
+
+                  {/* ── Ad-hoc "Add More" slots (max 10) ── */}
+                  {Array.from({ length: visibleSlotCount }).map((_, idx) => {
+                    const slot = adHocSlots[idx];
+                    return (
+                      <View key={`adhoc-${idx}`} style={usedItemStyles.adHocBlock}>
+                        {/* Header row: # Item1 + red X */}
+                        <View style={usedItemStyles.slotHeaderRow}>
+                          <Text style={usedItemStyles.slotLabel}>{t('item')}{idx + 1}</Text>
+                          <Pressable
+                            hitSlop={8}
+                            onPress={() => {
+                              setAdHocSlots(prev => prev.filter((_, i) => i !== idx));
+                              setVisibleSlotCount(c => c - 1);
+                            }}
+                          >
+                            <Ionicons name="close" size={sp(22)} color={COLORS.primary} />
+                          </Pressable>
+                        </View>
+
+                        {/* Item row: dropdown | avl qty | used qty */}
+                        <View style={usedItemStyles.itemRow}>
+                          {/* Dropdown-style item picker */}
+                          <Pressable
+                            style={usedItemStyles.itemPickerBtn}
+                            onPress={() => {
+                              pendingSlotIndexRef.current = idx;
+                              loadIssueList(); // retries if the first load failed or came back empty
+                              setShowItemPicker(true);
+                            }}
+                          >
+                            <Text
+                              style={[
+                                usedItemStyles.itemPickerText,
+                                !slot?.itemName && { color: '#ABABAB' },
+                              ]}
+                              numberOfLines={1}
+                            >
+                              {slot?.itemName || 'Item Name'}
+                            </Text>
+                            <Ionicons name="chevron-down" size={sp(18)} color="#ABABAB" />
+                          </Pressable>
+
+                          {/* Available qty pill — always visible, shows 0 until item selected */}
+                          <View style={usedItemStyles.assignedPill}>
+                            <Text style={usedItemStyles.assignedQtyText}>
+                              {slot?.avlQty ?? 0}
+                            </Text>
+                          </View>
+
+                          {/* Used qty input */}
+                          <DecimalInput integer
+                            value={slot?.usedQty ?? ''}
+                            onChangeText={val => {
+                              const num = Number(val);
+                              if (val !== '' && isNaN(num)) return;
+                              setAdHocSlots(prev => {
+                                const updated = [...prev];
+                                const existing = updated[idx];
+                                updated[idx] = {
+                                  itemIssuedId: existing?.itemIssuedId ?? 0,
+                                  itemId:       existing?.itemId ?? 0,
+                                  itemName:     existing?.itemName ?? '',
+                                  salesPrice:   existing?.salesPrice ?? 0,
+                                  avlQty:       existing?.avlQty ?? 0,
+                                  usedQty:      val,
+                                };
+                                return updated;
+                              });
+                            }}
+                            placeholderTextColor="#ABABAB"
+                            style={usedItemStyles.usedQtyInput}
+                          />
+                        </View>
+                      </View>
+                    );
+                  })}
+
+                  {/* + Add More */}
+                  {visibleSlotCount < MAX_ADHOC_SLOTS && (
+                    <Pressable style={usedItemStyles.addMoreBtn} onPress={handleAddMoreSlot}>
+                      <Text style={usedItemStyles.addMoreText}>{t('add_more')}</Text>
+                    </Pressable>
+                  )}
+                </>
+              )}
+            </ScrollView>
+
+            <Pressable style={usedItemStyles.updateBtn} onPress={handleUsedItemUpdate}>
+              <Text style={usedItemStyles.updateBtnText}>{t('update').toUpperCase()}</Text>
+            </Pressable>
+            <Pressable onPress={() => setShowUsedItemSheet(false)}>
+              <Text style={usedItemStyles.cancelText}>{t('cancel')}</Text>
+            </Pressable>
+
+          </KeyboardAvoidingView>
+        </View>
+      </Modal>
+
+      {/* ══════════════════════════════════════════════════════════════════
+          FSR CHECKPOINTS SHEET 
+      ══════════════════════════════════════════════════════════════════ */}
+      <Modal
+        visible={showFSRSheet}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowFSRSheet(false)}
+      >
+        <View style={styles.sheetOverlay}>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={fsrStyles.sheet}
+          >
+            <Pressable onPress={() => setShowFSRSheet(false)} hitSlop={10}>
+                <Ionicons name="close-circle" size={ms(34)} style={{ color: COLORS.primary, alignSelf: 'flex-end', marginRight: ms(8), marginTop: ms(8) }} />
+              </Pressable>
+              <Text style={fsrStyles.headerTitle} numberOfLines={1}>
+                {fsrName || 'FSR Checkpoints'}
+              </Text>
+
+            <ScrollView
+              contentContainerStyle={fsrStyles.listContent}
+              showsVerticalScrollIndicator={false}
+            >
+              {fsrLoading ? (
+                <ActivityIndicator size="large" color={COLORS.primary} style={{ marginTop: vs(30) }} />
+              ) : fsrCategories.length === 0 ? (
+                <Text style={fsrStyles.emptyText}>{t('rn_no_checkpoints_found_for_this_fsr')}</Text>
+              ) : (
+                fsrCategories.map(category => (
+                  <View key={category.CategoryId} style={fsrStyles.categoryBlock}>
+                    <Text style={fsrStyles.categoryName}>{category.CategoryName}</Text>
+
+                    {(category.lstCheckpointDTo ?? []).map(checkpoint => {
+                      const selectedStatusId = fsrSelections[checkpoint.CheckpointId] ?? 0;
+                      const selectedLabel = fsrStatusOptions.find(
+                        o => o.CheckpointStatusId === selectedStatusId
+                      )?.CheckpointStatusName;
+
+                      return (
+                        <View key={checkpoint.CheckpointId} style={fsrStyles.checkpointRow}>
+                          <Text style={fsrStyles.checkpointName} numberOfLines={2}>
+                            {checkpoint.CheckpointName}
+                          </Text>
+
+                          <Pressable
+                            style={fsrStyles.statusSelectBtn}
+                            onPress={() => setActiveCheckpointPicker(checkpoint.CheckpointId)}
+                          >
+                            <Text
+                              style={[
+                                fsrStyles.statusSelectText,
+                                !selectedLabel && fsrStyles.statusSelectPlaceholder,
+                              ]}
+                            >
+                              {selectedLabel || 'Select'}
+                            </Text>
+                            <Ionicons name="chevron-down" size={sp(18)} />
+                          </Pressable>
+                        </View>
+                      );
+                    })}
+                  </View>
+                ))
+              )}
+            </ScrollView>
+
+            <Pressable
+              style={[fsrStyles.submitBtn, fsrSubmitting && { opacity: 0.6 }]}
+              onPress={handleSubmitFSRCheckpoints}
+              disabled={fsrSubmitting}
+            >
+              {fsrSubmitting ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={fsrStyles.submitBtnText}>{t('submit').toUpperCase()}</Text>
+              )}
+            </Pressable>
+          </KeyboardAvoidingView>
+        </View>
+      </Modal>
+
+      {/* Checkpoint status picker */}
+      <Modal
+        visible={activeCheckpointPicker !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setActiveCheckpointPicker(null)}
+      >
+        <Pressable
+          style={styles.modalBackdrop}
+          onPress={() => setActiveCheckpointPicker(null)}
+        >
+          <Pressable>
+            <View style={usedItemStyles.pickerSheet}>
+              <ScrollView style={{ maxHeight: vs(350) }}>
+                {fsrStatusOptions.map(opt => (
+                  <Pressable
+                    key={opt.CheckpointStatusId}
+                    style={usedItemStyles.pickerRow}
+                    onPress={() => {
+                      if (activeCheckpointPicker !== null) {
+                        handleSelectCheckpointStatus(activeCheckpointPicker, opt.CheckpointStatusId);
+                      }
+                      setActiveCheckpointPicker(null);
+                    }}
+                  >
+                    <Text style={usedItemStyles.pickerRowText}>{opt.CheckpointStatusName}</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* Java UpdateUsedItems_FW: dialog_searchable_spinner_item -- the shared dialog. */}
+      <SearchPickerModal
+        visible={showItemPicker}
+        title={t('select_item')}
+        options={issueList.map(i => ({ id: i.Id, label: i.Name }))}
+        loading={issueListLoading}
+        onSelect={option => {
+          const item = issueList.find(i => i.Id === option.id);
+          const idx = pendingSlotIndexRef.current;
+          if (item && idx >= 0) {
+            setAdHocSlots(prev => {
+              const updated = [...prev];
+              updated[idx] = {
+                itemIssuedId: item.Id,       // Id from AllItemList
+                itemId:       item.ItemId,
+                itemName:     item.Name,
+                salesPrice:   item.SalesPrice,
+                avlQty:       item.Quantity, // UnAssignedQuantity mapped above
+                usedQty:      updated[idx]?.usedQty ?? '',
+              };
+              return updated;
+            });
+          }
+          setShowItemPicker(false);
+        }}
+        onClose={() => setShowItemPicker(false)}
+      />
+
+
+      {/* Off-screen signature replicas used only to produce PNGs (see SignatureSnapshot). */}
+      <View pointerEvents="none" style={{ position: 'absolute', left: -10000, top: 0 }}>
+        {customerSignPaths.length > 0 && (
+          <SignatureSnapshot ref={customerSnapshotRef} paths={customerSignPaths} size={customerPadSize} />
+        )}
+        {techSignPaths.length > 0 && (
+          <SignatureSnapshot ref={techSnapshotRef} paths={techSignPaths} size={techPadSize} />
+        )}
+      </View>
+    </KeyboardAvoidingView>
+  );
+}
+
+// ─── Used Item Styles ─────────────────────────────────────────────────────────
+
+const usedItemStyles = StyleSheet.create({
+  sheet: {
+    // update_used_items.xml: CardView with 30dp top corners
+    backgroundColor: COLORS.white,
+    width: '100%',
+    maxWidth: scale(560),
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+    paddingBottom: ms(4),
+    maxHeight: '85%',
+  },
+  header: {
+    // gradient_addtask: solid #353935, 20dp corners
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: COLORS.statusOnHold,
+    borderRadius: ms(20),
+    paddingLeft: ms(20),
+    paddingRight: ms(30),
+    height: ms(60),
+  },
+  headerTitle: {
+    fontSize: sp(22),
+    color: COLORS.white,
+  },
+  listContent: {
+    paddingHorizontal: ms(10),
+    paddingTop: ms(30),
+    paddingBottom: ms(10),
+    gap: ms(10),
+  },
+  emptyText: {
+    textAlign: 'center',
+    color: COLORS.lightGray,
+    fontSize: sp(14),
+    marginTop: ms(10),
+  },
+  sectionBlock: {
+    gap: vs(12),
+  },
+  itemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: scale(10),
+  },
+  itemName: {
+    flex: 1,
+    fontSize: sp(14),
+    color: COLORS.ink,
+    flexShrink: 1,
+  },
+  assignedPill: {
+    height: ms(36),
+    width: ms(50),
+    borderWidth: 1,
+    borderColor: COLORS.lightGray,
+    borderRadius: ms(34),
+    paddingHorizontal: ms(8),
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  assignedQtyText: {
+    fontSize: sp(14),
+    fontWeight: 'bold',
+    color: COLORS.textBlack,
+    flex: 1,
+    flexShrink: 1,
+    textAlign: 'center',
+  },
+  usedQtyInput: {
+    width: ms(124),
+    height: ms(36),
+    borderWidth: 1,
+    borderColor: COLORS.lightGray,
+    borderRadius: ms(34),
+    paddingHorizontal: ms(12),
+    paddingVertical: 0,
+    fontSize: sp(14),
+    fontWeight: 'bold',
+    color: '#535353',
+    textAlign: 'center',
+  },
+  adHocBlock: {
+    marginBottom: vs(4),
+  },
+  addMoreBtn: {
+    alignSelf: 'stretch',
+    height: ms(30),
+    marginTop: ms(10),
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  addMoreText: {
+    fontSize: sp(18),
+    color: COLORS.primary,
+    fontWeight: 'bold',
+  },
+  updateBtn: {
+    marginHorizontal: ms(20),
+    marginTop: ms(20),
+    marginBottom: ms(20),
+    height: ms(48),
+    backgroundColor: COLORS.statusOnHold,
+    borderRadius: ms(34),
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+  },
+  updateBtnText: {
+    color: COLORS.white,
+    fontSize: sp(18),
+  },
+  cancelText: {
+    color: COLORS.primary,
+    fontSize: sp(18),
+    textAlign: 'center',
+    marginBottom: ms(20),
+  },
+  pickerSheet: {
+    backgroundColor: '#fff',
+    borderRadius: scale(12),
+    width: scale(280),
+    maxHeight: vs(420),
+    padding: scale(12),
+    elevation: 10,
+  },
+  pickerSearch: {
+    height: vs(40),
+    borderWidth: 1.2,
+    borderColor: '#a6a6a6',
+    borderRadius: scale(20),
+    paddingHorizontal: scale(14),
+    fontSize: sp(16),
+    color: '#1C1C1E',
+    marginBottom: vs(8),
+  },
+  pickerRow: {
+    paddingVertical: vs(12),
+    paddingHorizontal: scale(8),
+    borderBottomWidth: 1,
+    borderBottomColor: '#F3F4F6',
+  },
+  pickerRowText: {
+    fontSize: sp(16),
+    color: '#1C1C1E',
+  },
+  slotHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: vs(6),
+  },
+  slotLabel: {
+    fontSize: sp(15),
+    fontWeight: 'bold',
+    color: COLORS.primary,
+    paddingLeft: ms(15),
+  },
+  itemPickerBtn: {
+    flex: 1,
+    height: ms(36),
+    borderWidth: 1,
+    borderColor: COLORS.lightGray,
+    borderRadius: ms(34),
+    paddingHorizontal: ms(12),
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  itemPickerText: {
+    fontSize: sp(14),
+    color: COLORS.textBlack,
+    flex: 1,
+  },
+  assignedPlain: {
+    width: ms(50),
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+});
+
+// ─── Signature Modal Styles ───────────────────────────────────────────────────
+
+const fsrStyles = StyleSheet.create({
+  sheet: {
+    // dialog_fsr_with_checkpoints.xml: 30dp top corners
+    backgroundColor: COLORS.white,
+    width: '100%',
+    maxWidth: scale(560),
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+    maxHeight: '95%',
+    overflow: 'hidden',
+  },
+  headerTitle: {
+    textAlign: 'center',
+    fontSize: sp(22),
+    color: COLORS.ink,
+    marginTop: ms(-16),
+    marginBottom: ms(10),
+    paddingHorizontal: ms(20),
+  },
+  listContent: {
+    paddingHorizontal: ms(20),
+    paddingBottom: ms(20),
+  },
+  emptyText: {
+    textAlign: 'center',
+    color: '#888',
+    fontSize: sp(16),
+    marginTop: vs(30),
+  },
+  categoryBlock: {
+    marginBottom: vs(16),
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#E5E5E5',
+    borderRadius: scale(14),
+    padding: scale(16),
+    paddingBottom: vs(4),
+  },
+  categoryName: {
+    fontSize: sp(18),
+    fontWeight: '500',
+    color: COLORS.primary,
+    marginBottom: vs(14),
+  },
+  checkpointRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: vs(12),
+    gap: scale(12),
+  },
+  checkpointName: {
+    flex: 1,
+    fontSize: sp(16),
+    color: '#1C1C1E',
+  },
+  
+  submitBtn: {
+    backgroundColor: COLORS.textBlack,
+    marginHorizontal: ms(20),
+    marginTop: ms(10),
+    marginBottom: ms(30),
+    minHeight: ms(48),
+    borderRadius: ms(10),
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  submitBtnText: {
+    color: COLORS.white,
+    fontSize: sp(18),
+  },
+  statusSelectBtn: {
+    width: scale(150),
+    height: vs(30),
+    borderWidth: 1.2,
+    borderColor: '#C8C8C8',
+    borderRadius: scale(30),
+    paddingHorizontal: scale(14),
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#fff',
+  },
+  statusSelectText: {
+    fontSize: sp(15),
+    color: '#565656',
+  },
+  statusSelectPlaceholder: {
+    color: '#ABABAB',
+  },
+});
+
+const sigModalStyles = StyleSheet.create({
+  dropdownActive: {
+    backgroundColor: COLORS.white,
+    borderColor: COLORS.primary,
+  },
+  expandedSection: {
+    marginTop: vs(8),
+    marginBottom: vs(8),
+  },
+  fieldsAndPhoto: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+  },
+  fieldsCol: {
+    width: ms(180),
+  },
+  roundedInput: {
+    // TextInputLayoutStyle: outlined, 34dp corners, 1dp light_gray stroke
+    height: ms(56),
+    borderWidth: 1,
+    borderColor: COLORS.lightGray,
+    borderRadius: ms(34),
+    paddingHorizontal: ms(16),
+    fontSize: sp(16),
+    color: COLORS.ink,
+    backgroundColor: COLORS.white,
+  },
+  photoSlot: {
+    width: ms(120),
+    height: ms(100),
+    borderWidth: 1,
+    borderColor: COLORS.lightGray,
+    borderRadius: ms(15),
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.white,
+    overflow: 'hidden',
+  },
+  photoThumb: {
+    width: '100%',
+    height: '100%',
+  },
+  photoRemoveBtn: {
+    position: 'absolute',
+    top: scale(4),
+    right: scale(4),
+    width: scale(18),
+    height: scale(18),
+    borderRadius: scale(9),
+    backgroundColor: 'rgba(239,68,68,0.85)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  signatureRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: ms(10),
+    marginBottom: ms(10),
+  },
+  signatureLabel: {
+    fontSize: sp(16),
+    color: COLORS.ink,
+  },
+  clearText: {
+    fontSize: sp(14),
+    color: COLORS.primary,
+  },
+  techInfoLabel: {
+    fontSize: sp(22),
+    color: COLORS.ink,
+    textAlign: 'center',
+    marginBottom: ms(5),
+    marginTop: ms(5),
+  },
+  techPhotoSlot: {
+    width: ms(120),
+    height: ms(100),
+    alignSelf: 'flex-end',
+    borderWidth: 1,
+    borderColor: COLORS.lightGray,
+    borderRadius: ms(15),
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.white,
+    overflow: 'hidden',
+    marginBottom: ms(5),
+  },
+  techPhotoThumb: {
+    width: '100%',
+    height: '100%',
+    resizeMode: 'cover',
+  },
+  remarkContainer: {
+    marginTop: vs(12),
+  },
+});
+
+// ─── Main Styles ──────────────────────────────────────────────────────────────
+
+const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+    backgroundColor: COLORS.primary,
+  },
+  redBg: { height: 0, backgroundColor: COLORS.primary },
+  scroll: {
+    flex: 1,
+    backgroundColor: COLORS.white,
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+  },
+  scrollContent: {
+    // CardView padding 10dp + ScrollView content padding 10dp
+    padding: ms(20),
+    paddingBottom: ms(24),
+  },
+  card: {
+    // bg_border: 10dp radius, 1dp #f4f4f4 stroke; sections 10dp apart, 10dp padding
+    backgroundColor: COLORS.white,
+    marginTop: ms(10),
+    padding: ms(10),
+    borderWidth: 1,
+    borderColor: '#F4F4F4',
+    borderRadius: ms(10),
+  },
+  cardTitle: {
+    fontSize: sp(14),
+    fontWeight: 'bold',
+    color: COLORS.ink,
+  },
+  cardSubtitle: {
+    fontSize: sp(12),
+    color: COLORS.lightGray,
+  },
+  photoRow: {
+    flexDirection: 'row',
+    gap: scale(18),
+  },
+  photoSlot: {
+    width: ms(100),
+    height: ms(100),
+    marginRight: ms(10),
+    borderWidth: 1,
+    borderColor: COLORS.lightGray,
+    borderRadius: ms(15),
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.white,
+    overflow: 'hidden',
+  },
+  photoThumb: {
+    width: '100%',
+    height: '100%',
+  },
+  photoRemoveBtn: {
+    position: 'absolute',
+    top: scale(4),
+    right: scale(4),
+    width: scale(18),
+    height: scale(18),
+    borderRadius: scale(15),
+    borderColor: '#bcbcbc',
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  workModeRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: ms(20),
+    marginTop: ms(4),
+  },
+  radioItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: scale(6),
+  },
+  radioOuter: {
+    width: scale(20),
+    height: scale(20),
+    borderRadius: scale(10),
+    borderWidth: 2,
+    borderColor: '#a6a6a6',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  radioOuterActive: {
+    borderColor: COLORS.primary,
+  },
+  radioInner: {
+    width: scale(10),
+    height: scale(10),
+    borderRadius: scale(5),
+    backgroundColor: COLORS.primary,
+  },
+  radioLabel: {
+    fontSize: sp(14),
+    color: COLORS.ink,
+  },
+  addRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#F4F4F4',
+    borderRadius: ms(30),
+    height: ms(34),
+    marginHorizontal: ms(5),
+    marginTop: ms(5),
+    marginBottom: ms(5),
+    overflow: 'hidden',
+  },
+  addRowPlaceholder: {
+    flex: 1,
+    paddingHorizontal: ms(14),
+    fontSize: sp(14),
+    color: COLORS.midGray,
+    textAlign: 'center',
+  },
+  plusBtn: {
+    fontSize: sp(26),
+    color: COLORS.primary,
+    paddingHorizontal: ms(14),
+    lineHeight: sp(28),
+  },
+  noteChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    borderRadius: ms(30),
+    borderWidth: 1,
+    borderColor: '#F4F4F4',
+    paddingHorizontal: ms(14),
+    height: ms(34),
+    marginHorizontal: ms(5),
+    marginBottom: ms(5),
+    gap: ms(8),
+  },
+  noteChipIndex: {
+    fontSize: sp(14),
+    fontWeight: '600',
+    color: COLORS.textBlack,
+    minWidth: ms(16),
+  },
+  noteChipText: {
+    flex: 1,
+    fontSize: sp(14),
+    color: COLORS.textBlack,
+  },
+  noteChipPlaceholder: {
+    color: COLORS.midGray,
+  },
+  notAllowedText: {
+    fontSize: sp(12),
+    color: COLORS.primary,
+    marginTop: vs(4),
+    marginLeft: scale(4),
+  },
+  sheetOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+  },
+  sheetContainer: {
+    // dialog_add_note.xml: 30dp top corners, 20dp padding
+    backgroundColor: COLORS.white,
+    width: '100%',
+    maxWidth: scale(560),
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+    padding: ms(20),
+  },
+  sheetContent: {},
+  sheetTitle: {
+    fontSize: sp(22),
+    color: COLORS.ink,
+    textAlign: 'center',
+    marginBottom: ms(20),
+  },
+  sheetTextArea: {
+    flex: 1,
+    padding: ms(10),
+    fontSize: sp(16),
+    color: COLORS.ink,
+  },
+  sheetSaveBtn: {
+    marginTop: ms(10),
+    marginBottom: ms(20),
+    height: ms(48),
+    backgroundColor: COLORS.primary,
+    borderRadius: ms(34),
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+  },
+  sheetSaveBtnText: {
+    color: COLORS.white,
+    fontSize: sp(18),
+  },
+  sheetCancelText: {
+    color: COLORS.primary,
+    fontSize: sp(18),
+    textAlign: 'center',
+    marginBottom: ms(20),
+  },
+  deviceChipWrapper: {
+    marginHorizontal: ms(5),
+    marginTop: ms(5),
+    marginBottom: ms(5),
+    borderWidth: 1,
+    borderColor: '#F4F4F4',
+    borderRadius: ms(34),
+    overflow: 'hidden',
+  },
+  deviceForm: {
+    marginHorizontal: ms(10),
+    marginBottom: ms(20),
+  },
+  deviceInput: {
+    marginTop: ms(10),
+    paddingVertical: ms(8),
+    paddingHorizontal: ms(14),
+    borderWidth: 1,
+    borderColor: '#F4F4F4',
+    borderRadius: ms(34),
+    backgroundColor: COLORS.white,
+    fontSize: sp(16),
+    color: COLORS.ink,
+  },
+  photoInner: {
+    flex: 1,
+    alignSelf: 'stretch',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  photoPreview: {
+    width: '100%',
+    height: '100%',
+    borderRadius: scale(12),
+  },
+  tilesRow: {
+    flexDirection: 'row',
+    marginHorizontal: ms(4),
+    marginVertical: ms(8),
+  },
+  tile: {
+    // 120dp tiles, 4dp margin, bg_border with a tint
+    flex: 1,
+    height: ms(120),
+    margin: ms(4),
+    padding: ms(8),
+    backgroundColor: '#F0F6FF',
+    borderWidth: 1,
+    borderColor: '#F4F4F4',
+    borderRadius: ms(10),
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  tileTitle: {
+    fontSize: sp(14),
+    fontWeight: 'bold',
+    color: COLORS.ink,
+    textAlign: 'center',
+  },
+  tileSub: {
+    marginTop: ms(10),
+    fontSize: sp(12),
+    color: '#757575',
+    textAlign: 'center',
+  },
+  naCard: {
+    height: ms(100),
+    marginTop: ms(10),
+    paddingHorizontal: ms(10),
+    paddingTop: ms(5),
+    backgroundColor: 'rgba(211,204,206,0.45)',
+    borderWidth: 1,
+    borderColor: '#F4F4F4',
+    borderRadius: ms(10),
+  },
+  naTitle: {
+    fontSize: sp(14),
+    fontWeight: 'bold',
+    color: COLORS.ink,
+  },
+  naSub: {
+    ...StyleSheet.absoluteFill,
+    textAlign: 'center',
+    textAlignVertical: 'center',
+    fontSize: sp(12),
+    fontWeight: 'bold',
+    color: '#757575',
+  },
+  signatureArea: {
+    ...StyleSheet.absoluteFill,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  signaturePlaceholder: {
+    fontSize: sp(12),
+    fontWeight: 'bold',
+    color: '#757575',
+    textAlign: 'center',
+  },
+  bottomSheetOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+  },
+  signatureSheet: {
+    // signature_rate.xml: 30dp top corners, 10dp padding
+    backgroundColor: COLORS.white,
+    width: '100%',
+    maxWidth: scale(560),
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+    padding: ms(10),
+    maxHeight: '92%',
+  },
+  signatureSheetTitle: {
+    textAlign: 'center',
+    fontSize: sp(18),
+    color: COLORS.ink,
+    marginBottom: ms(5),
+  },
+  signatureDropdown: {
+    // rounded_border_tab: 20dp radius, 1dp colorPrimaryDark stroke
+    minHeight: ms(48),
+    marginTop: ms(5),
+    marginBottom: ms(5),
+    borderWidth: 1,
+    borderColor: COLORS.primary,
+    borderRadius: ms(20),
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: ms(25),
+  },
+  signatureDropdownText: {
+    flex: 1,
+    textAlign: 'center',
+    fontSize: sp(16),
+    color: COLORS.primary,
+    fontWeight: '500',
+  },
+  signatureSaveBtn: {
+    marginTop: ms(5),
+    marginBottom: ms(20),
+    height: ms(48),
+    backgroundColor: COLORS.primary,
+    borderRadius: ms(34),
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+  },
+  signatureSaveText: {
+    color: COLORS.white,
+    fontSize: sp(18),
+  },
+  signatureCancelText: {
+    color: COLORS.primary,
+    fontSize: sp(18),
+    textAlign: 'center',
+    marginBottom: ms(20),
+  },
+  dashedBox: {
+    width: '100%',
+    height: '50%',
+    marginTop: ms(12),
+    alignSelf: 'center',
+    borderWidth: 1,
+    borderColor: '#A9A9A9',
+    borderStyle: 'dashed',
+    overflow: 'hidden',
+    backgroundColor: COLORS.white,
+  },
+  dashedInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: ms(8),
+    paddingHorizontal: ms(12),
+  },
+  attachLabel: {
+    fontSize: sp(14),
+    color: '#000000',
+    marginLeft: ms(10),
+  },
+  attachThumb: {
+    width: '100%',
+    height: vs(80),
+  },
+  requestBtn: {
+    marginTop: ms(20),
+    marginBottom: ms(5),
+    height: ms(48),
+    backgroundColor: COLORS.statusOnHold,
+    borderRadius: ms(34),
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+  },
+  requestBtnText: {
+    color: COLORS.white,
+    fontSize: sp(18),
+  },
+  continueBtn: {
+    marginTop: ms(20),
+    marginBottom: ms(20),
+    height: ms(48),
+    backgroundColor: COLORS.primary,
+    borderRadius: ms(34),
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+  },
+  continueBtnText: {
+    color: COLORS.white,
+    fontSize: sp(18),
+  },
+  fieldPhotoRow: {
+    paddingHorizontal: ms(10),
+    marginTop: ms(10),
+    marginBottom: ms(10),
+    alignItems: 'center',
+  },
+  boxCard: {
+    // FSR / signature / attachment wrappers are fixed 100dp boxes with the hint centred
+    height: ms(100),
+    paddingTop: ms(5),
+  },
+  boxGrey: {
+    backgroundColor: 'rgba(211,204,206,0.45)',
+  },
+  sheetField: {
+    height: ms(200),
+    borderWidth: 1,
+    borderColor: COLORS.lightGray,
+    borderRadius: ms(34),
+  },
+  sheetFieldLabel: {
+    position: 'absolute',
+    top: -ms(9),
+    left: ms(24),
+    paddingHorizontal: ms(4),
+    backgroundColor: COLORS.white,
+    fontSize: sp(12),
+    color: '#2A7D6F',
+    zIndex: 1,
+  },
+  signatureCaret: {
+    position: 'absolute',
+    right: ms(25),
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: scale(32),
+  },
+  deviceHeader: {
+    height: ms(35),
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  deviceIndex: {
+    width: ms(50),
+    textAlign: 'center',
+    fontSize: sp(16),
+    fontWeight: 'bold',
+    color: COLORS.ink,
+  },
+  deviceHeaderText: {
+    flex: 1,
+    textAlign: 'center',
+    fontSize: sp(14),
+    color: COLORS.textBlack,
+    marginRight: ms(10),
+  },
+  devicePhotoRow: {
+    flexDirection: 'row',
+    gap: ms(10),
+    marginTop: ms(10),
+    marginHorizontal: ms(5),
+  },
+  devicePhotoSlot: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 0,
+    minWidth: 0,
+    height: ms(100),
+    borderWidth: 1,
+    borderColor: '#F4F4F4',
+    borderRadius: ms(10),
+    overflow: 'hidden',
+  },
+  devicePhotoRemove: {
+    position: 'absolute',
+    top: ms(5),
+    right: ms(5),
+    zIndex: 2,
+    width: ms(15),
+    height: ms(15),
+    borderRadius: ms(8),
+    borderWidth: 1,
+    borderColor: '#F4F4F4',
+    backgroundColor: COLORS.white,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+});

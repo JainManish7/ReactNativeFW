@@ -1,0 +1,3262 @@
+import { numpadAccessoryId } from '../../components/NumpadDoneBar';
+// src/screens/admin/AMCDashboardScreen.tsx
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import {ms, sp} from '../../utils/responsive';
+import {COLORS} from '../../theme/theme';
+import {AmcIcon} from '../../components/FabIcons';
+import ContactBookButton from '../../components/ContactBookButton';
+import {useContactPicker} from '../../hooks/useContactPicker';
+import {ensureSuccess} from '../../utils/apiResponse';
+import {sanitizeDecimalInput} from '../../utils/decimal';
+import {
+  ActivityIndicator,
+  FlatList,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import Modal from '../../components/AppModal';
+import SearchPickerModal from '../../components/SearchPickerModal';
+import Ionicons from 'react-native-vector-icons/Ionicons';
+import { useNavigation } from '@react-navigation/native';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { getAmcTypeList, getServiceOccurrenceList, getReminderModeList, getAmcServiceMonthList, addAmc } from '../../api/amc/amcService';
+import type {
+  AMCTypeListResultData as AMCTypeItem,
+  AMCListResultData as AMCListItem,
+  ServiceOccurrenceListResultData,
+  ReminderModeListResultData,
+} from '../../api/amc/amc.types';
+import { getCustomerList } from '../../api/customerList/customerListService';
+import type { CustomerListResultData } from '../../api/customerList/customerList.types';
+
+type AMCLookupItem =
+  | ServiceOccurrenceListResultData
+  | ReminderModeListResultData;
+type CustomerLookupItem = CustomerListResultData;
+import { getCurrentUserId } from '../../state/session';
+import type { AdminStackParamList } from '../../navigation/AdminStack';
+import { showFailureMsg, showSuccessMsg } from '../../utils/toast';
+import PlaceSearchModal from '../../components/PlaceSearchModal';
+import DecimalInput from '../../components/DecimalInput';
+
+import {useTranslation} from 'react-i18next';
+import { tr } from '../../i18n/tr';
+/** Java AMCDialog.addAMCFromQuoteDialog: the Add AMC form opened from a quotation, pre-filled from it. */
+export type AddAmcPrefill = {
+  name: string;
+  customerName: string;
+  customerNumber: string;
+  address: string;
+  landmark: string;
+  latitude: string;
+  longitude: string;
+  /** Grand total, shown as the AMC amount. */
+  amount: number;
+  /** Quote CreatedDate (ISO): becomes the activation date and service time. */
+  createdDate: string;
+  customerId?: number;
+};
+
+type AMCDashboardScreenProps = {
+  ownerId: number;
+  openAddAmcTrigger?: number;
+  onAddAmcModalClose?: () => void;
+  /** Render only the Add AMC form (no list / header), used from Quotation Details. */
+  modalOnly?: boolean;
+  addAmcPrefill?: AddAmcPrefill;
+};
+
+type AMCTypeOption = {
+  id: number;
+  name: string;
+};
+
+type MonthOption = {
+  month: number;
+  year: number;
+  label: string;
+};
+
+type AMCDateField = 'activation' | 'contract' | 'expiry';
+
+type AddAMCDropdownKind = 'services' | 'occurrence' | 'reminder';
+
+type AddAMCDropdownOption = {
+  id: number;
+  name: string;
+};
+
+type CustomerOption = {
+  id: number;
+  name: string;
+  phone: string;
+  email: string;
+  address: string;
+  landmark: string;
+  brandName: string;
+  modelName: string;
+  serialNo: string;
+};
+
+const THEME_PRIMARY = '#d30035';
+
+const SERIAL_NO_MAX_LENGTH = 10;
+
+const normalizeSerialNo = (text: string) =>
+  text.toUpperCase().slice(0, SERIAL_NO_MAX_LENGTH);
+
+const MONTH_LABELS = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+export const getResultData = <T,>(response: {
+  resultData?: T[] | null;
+  ResultData?: T[] | null;
+}) => response.resultData ?? response.ResultData ?? [];
+
+const getStringValue = (item: object, keys: string[]) => {
+  const record = item as Record<string, unknown>;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return String(value);
+    }
+  }
+
+  return '';
+};
+
+const getNumberValue = (item: object, keys: string[]) => {
+  const record = item as Record<string, unknown>;
+  for (const key of keys) {
+    const parsed = Number(record[key]);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return 0;
+};
+
+const formatDateForApi = (month: number, day: number, year: number) =>
+  `${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}-${year}`;
+
+const formatDateForAddAMC = (month: number, day: number, year: number) =>
+  `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+const formatTimeForAddAMC = (date: Date) =>
+  date
+    .toLocaleTimeString('en-GB', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    })
+    .replace(/\s+/g, '')
+    .trim();
+
+const formatDateDDMMYYYY = (date: Date) => {
+  const day = String(date.getDate()).padStart(2, '0');
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const year = date.getFullYear();
+  return `${day}-${month}-${year}`;
+};
+
+const formatListDate = (rawDate: string) => {
+  if (!rawDate) {
+    return '';
+  }
+
+  const date = new Date(rawDate);
+  if (Number.isNaN(date.getTime())) {
+    return rawDate.split('T')[0] ?? rawDate;
+  }
+
+  return formatDateDDMMYYYY(date);
+};
+
+const formatFormDate = (date: Date) => formatDateDDMMYYYY(date);
+
+const formatCalculatedExpiryDate = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const formatFormTime = (date: Date) =>
+  date
+    .toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    })
+    .replace(/\s+/g, '')
+    .trim();
+
+const buildCalendarDays = (month: number, year: number) => {
+  const firstDay = new Date(year, month, 1).getDay();
+  const totalDays = new Date(year, month + 1, 0).getDate();
+  return [
+    ...Array.from({ length: firstDay }, () => 0),
+    ...Array.from({ length: totalDays }, (_, index) => index + 1),
+  ];
+};
+
+const getLastDayOfMonth = (year: number, month: number) =>
+  new Date(year, month + 1, 0).getDate();
+
+const addMonthsClamped = (date: Date, months: number) => {
+  const nextDate = new Date(date);
+  const targetMonth = nextDate.getMonth() + months;
+  const targetYear = nextDate.getFullYear() + Math.floor(targetMonth / 12);
+  const normalizedMonth = ((targetMonth % 12) + 12) % 12;
+  const day = Math.min(
+    nextDate.getDate(),
+    getLastDayOfMonth(targetYear, normalizedMonth),
+  );
+
+  nextDate.setFullYear(targetYear, normalizedMonth, day);
+  return nextDate;
+};
+
+const addYearsClamped = (date: Date, years: number) =>
+  addMonthsClamped(date, years * 12);
+
+const addDays = (date: Date, days: number) => {
+  const nextDate = new Date(date);
+  nextDate.setDate(nextDate.getDate() + days);
+  return nextDate;
+};
+
+const calculateAMCExpiryDate = (
+  activationDate: Date | null,
+  serviceCount: AddAMCDropdownOption | null,
+  occurrence: AddAMCDropdownOption | null,
+) => {
+  const noOfServices = Number(serviceCount?.name);
+  const occurrenceId = Number(occurrence?.id);
+
+  if (
+    !activationDate ||
+    !Number.isFinite(noOfServices) ||
+    noOfServices <= 0 ||
+    !Number.isFinite(occurrenceId) ||
+    occurrenceId === 0
+  ) {
+    return null;
+  }
+
+  const serviceOffset = noOfServices - 1;
+
+  switch (occurrenceId) {
+    case 1:
+      return addMonthsClamped(activationDate, serviceOffset);
+    case 2:
+      return addMonthsClamped(activationDate, serviceOffset * 3);
+    case 3:
+      return addYearsClamped(activationDate, serviceOffset);
+    case 4:
+      return addMonthsClamped(activationDate, serviceOffset * 6);
+    case 5:
+      return addMonthsClamped(activationDate, serviceOffset * 4);
+    case 6:
+      return addDays(activationDate, serviceOffset * 15);
+    case 7:
+      return addDays(activationDate, serviceOffset * 7);
+    case 8:
+      return addMonthsClamped(activationDate, serviceOffset * 2);
+    case 9:
+      return addDays(activationDate, serviceOffset);
+    case 10:
+      return addDays(activationDate, serviceOffset * 2);
+    default:
+      return null;
+  }
+};
+
+const buildMonthOptions = (): MonthOption[] => {
+  const now = new Date();
+  const year = now.getFullYear();
+  return MONTH_LABELS.map((label, index) => ({
+    month: index + 1,
+    year,
+    label: `${label} ${year}`,
+  }));
+};
+
+const normalizeAMCType = (item: AMCTypeItem): AMCTypeOption | null => {
+  const id = Number(item.AMCTypeId);
+  const name = String(item.AMCTypeName ?? '').trim();
+  if (!Number.isFinite(id) || !name) {
+    return null;
+  }
+
+  return { id, name };
+};
+
+export const normalizeLookupOption = (
+  item: AMCLookupItem,
+  index: number,
+): AddAMCDropdownOption | null => {
+  const fallbackId = Number(
+    Object.values(item).find(
+      value => typeof value === 'number' || /^\d+$/.test(String(value)),
+    ),
+  );
+  const id =
+    getNumberValue(item, [
+      'id',
+      'Id',
+      'ID',
+      'amcServiceOccuranceTypeId',
+      'AMCServiceOccuranceTypeId',
+      'AMCServiceOccuranceTypeID',
+      'amcServiceOccuranceId',
+      'AMCServiceOccuranceId',
+      'AMCServiceOccuranceID',
+      'amcServiceOccurrenceTypeId',
+      'AMCServiceOccurrenceTypeId',
+      'AMCServiceOccurrenceTypeID',
+      'serviceOccuranceTypeId',
+      'ServiceOccuranceTypeId',
+      'ServiceOccuranceTypeID',
+      'occurrenceId',
+      'OccurrenceId',
+      'OccurrenceID',
+      'occuranceId',
+      'OccuranceId',
+      'OccuranceID',
+      'reminderId',
+      'ReminderId',
+      'ReminderID',
+      'amcSetReminderId',
+      'AMCSetReminderId',
+      'AMCSetReminderID',
+      'setReminderId',
+      'SetReminderId',
+      'SetReminderID',
+    ]) ||
+    (Number.isFinite(fallbackId) ? fallbackId : 0) ||
+    index + 1;
+  const name =
+    getStringValue(item, [
+      'name',
+      'Name',
+      'amcServiceOccuranceTypeName',
+      'AMCServiceOccuranceTypeName',
+      'amcServiceOccuranceName',
+      'AMCServiceOccuranceName',
+      'amcServiceOccurrenceTypeName',
+      'AMCServiceOccurrenceTypeName',
+      'serviceOccuranceTypeName',
+      'ServiceOccuranceTypeName',
+      'serviceOccuranceName',
+      'ServiceOccuranceName',
+      'occurrenceName',
+      'OccurrenceName',
+      'occuranceName',
+      'OccuranceName',
+      'reminderName',
+      'ReminderName',
+      'amcSetReminderName',
+      'AMCSetReminderName',
+      'amcSetRemindersName',
+      'AMCSetRemindersName',
+      'setReminderName',
+      'SetReminderName',
+      'reminder',
+      'Reminder',
+    ]) ||
+    Object.values(item).find(
+      value => typeof value === 'string' && value.trim(),
+    );
+
+  if (!name) {
+    return null;
+  }
+
+  return { id, name: String(name).trim() };
+};
+
+const normalizeCustomerOption = (
+  item: CustomerLookupItem,
+  index: number,
+): CustomerOption | null => {
+  const fallbackId = Number(
+    Object.values(item).find(
+      value => typeof value === 'number' || /^\d+$/.test(String(value)),
+    ),
+  );
+  const id =
+    getNumberValue(item, [
+      'customerId',
+      'CustomerId',
+      'CustomerID',
+      'id',
+      'Id',
+      'ID',
+    ]) ||
+    (Number.isFinite(fallbackId) ? fallbackId : 0) ||
+    index + 1;
+  const name = getStringValue(item, [
+    'customerName',
+    'CustomerName',
+    'name',
+    'Name',
+    'fullName',
+    'FullName',
+  ]);
+
+  if (!name) {
+    return null;
+  }
+
+  return {
+    id,
+    name,
+    phone: getStringValue(item, [
+      'customerNumber',
+      'CustomerNumber',
+      'customerMobileNumber',
+      'CustomerMobileNumber',
+      'customerMobileNo',
+      'CustomerMobileNo',
+      'contactNo',
+      'ContactNo',
+      'contactNumber',
+      'ContactNumber',
+      'mobileNo',
+      'MobileNo',
+      'mobileNumber',
+      'MobileNumber',
+      'Mobile',
+      'mobile',
+      'phone',
+      'Phone',
+      'phoneNo',
+      'PhoneNo',
+      'phoneNumber',
+      'PhoneNumber',
+      'primaryMobile',
+      'PrimaryMobile',
+      'primaryMobileNumber',
+      'PrimaryMobileNumber',
+    ]),
+    email: getStringValue(item, ['emailId', 'EmailId', 'email', 'Email']),
+    address: getStringValue(item, [
+      'address',
+      'Address',
+      'customerAddress',
+      'CustomerAddress',
+      'fullAddress',
+      'FullAddress',
+    ]),
+    landmark: getStringValue(item, [
+      'landmark',
+      'Landmark',
+      'landMark',
+      'LandMark',
+      'customerLandmark',
+      'CustomerLandmark',
+    ]),
+    brandName: getStringValue(item, [
+      'brandName',
+      'BrandName',
+      'brand',
+      'Brand',
+      'productBrand',
+      'ProductBrand',
+    ]),
+    modelName: getStringValue(item, [
+      'modelName',
+      'ModelName',
+      'modelNo',
+      'ModelNo',
+      'modelNumber',
+      'ModelNumber',
+      'productModel',
+      'ProductModel',
+    ]),
+    serialNo: getStringValue(item, [
+      'serialNo',
+      'SerialNo',
+      'serialNumber',
+      'SerialNumber',
+      'productSerialNo',
+      'ProductSerialNo',
+    ]),
+  };
+};
+
+const filterCustomerOptions = (customers: CustomerOption[], query: string) => {
+  const searchTerm = query.trim().toLowerCase();
+  if (searchTerm.length < 2) {
+    return [];
+  }
+
+  return customers
+    .filter(option => option.name.toLowerCase().includes(searchTerm))
+    .slice(0, 20);
+};
+
+const getAMCKey = (item: AMCListItem, index: number) => {
+  const id = String(item.AMCsId ?? item.AMCServiceDetailsId ?? '');
+  // Combine ID with index to ensure uniqueness even if IDs are duplicated
+  return id ? `${id}-${index}` : String(index);
+};
+
+const getAMCTitle = (item: AMCListItem) =>
+  getStringValue(item as Record<string, unknown>, [
+    'customerName',
+    'CustomerName',
+    'name',
+    'Name',
+    'amcName',
+    'AMCName',
+  ]) || 'AMC';
+
+// Java: AMCListAdapter.AMCName -- a distinct field from CustomerName, shown
+// as the small label above the bold customer name.
+const getAMCName = (item: AMCListItem) =>
+  getStringValue(item as Record<string, unknown>, ['amcName', 'AMCName']);
+
+// Java: AMCListAdapter binds the "Service Type" text to
+// amcItem.getServiceOccuranceType() (e.g. "Monthly"), NOT to a field named
+// ServiceType/AMCTypeName -- those key names used to be in this list, which
+// meant this accidentally picked up AMCTypeName (the Renewal/Expired/
+// Upcoming/Completed status, see getAMCStatus below) instead.
+const getAMCServiceType = (item: AMCListItem) =>
+  getStringValue(item as Record<string, unknown>, [
+    'serviceOccuranceType',
+    'ServiceOccuranceType',
+    'serviceType',
+    'ServiceType',
+  ]);
+
+// Java: amcItem.getAMCTypeName() -- "Renewal" | "Expired" | "Upcomming" |
+// "Completed" -- drives the colored status badge (amc_status_*.xml), not
+// displayed as text. Used for the timeline stripe color below.
+const getAMCStatus = (item: AMCListItem) =>
+  getStringValue(item as Record<string, unknown>, ['amcTypeName', 'AMCTypeName']);
+
+const AMC_STATUS_COLORS: Record<string, string> = {
+  Renewal: '#FF9B00',
+  Expired: '#9AA0A6',
+  Upcomming: '#2776FF',
+  Completed: '#03DE73',
+};
+
+const getAMCStatusColor = (item: AMCListItem) =>
+  AMC_STATUS_COLORS[getAMCStatus(item)] || '#8D99A6';
+
+const getAMCFieldWorker = (item: AMCListItem) =>
+  item.TaskDetails?.TechnicianName?.trim() ||
+  getStringValue(item as Record<string, unknown>, [
+    'fieldWorkerName',
+    'FieldWorkerName',
+    'technicianName',
+    'TechnicianName',
+    'userName',
+    'UserName',
+    'fieldworkername',
+    'technicianname',
+    'username',
+    'field_worker_name',
+    'Field_Worker_Name',
+    'technician_name',
+    'Technician_Name',
+    'user_name',
+    'User_Name',
+    'fieldWorker',
+    'FieldWorker',
+    'technician',
+    'Technician',
+  ]);
+
+const getAMCTaskId = (item: AMCListItem) =>
+  (item.TaskDetails?.TaskId ? String(item.TaskDetails.TaskId) : '') ||
+  getStringValue(item as Record<string, unknown>, [
+    'taskId',
+    'TaskId',
+    'newTaskID',
+    'NewTaskID',
+    'taskid',
+    'newtaskid',
+    'task_id',
+    'Task_Id',
+    'new_task_id',
+    'New_Task_Id',
+    'taskID',
+    'task_ID',
+  ]);
+
+// Java: AMCListAdapter binds this to amcItem.getAMCServiceDate() only --
+// TaskDetails.TaskDate is a different, unrelated field (the linked task's
+// own date, shown only alongside Fieldworker/Task ID below), and checking
+// it first here meant any row with a linked task showed that task's date
+// instead of the AMC's own scheduled service date.
+const getAMCRawDate = (item: AMCListItem) =>
+  getStringValue(item as Record<string, unknown>, [
+    'amcServiceDate',
+    'AMCServiceDate',
+    'taskDate',
+    'TaskDate',
+    'date',
+    'Date',
+    'amcDate',
+    'AMCDate',
+  ]);
+
+// Java: AMCListAdapter binds this to amcItem.getActivationTime() only (a
+// bare "HH:mm:ss" string) -- TaskDetails.TaskTime is the linked task's own
+// time, a different field Java never uses here. Same TaskDetails-priority
+// bug as getAMCRawDate above.
+const getAMCTime = (item: AMCListItem) =>
+  getStringValue(item as Record<string, unknown>, [
+    'activationTime',
+    'ActivationTime',
+    'taskTime',
+    'TaskTime',
+    'serviceTime',
+    'ServiceTime',
+    'time',
+    'Time',
+  ]) || item.TaskDetails?.TaskTime || '';
+
+const getAMCServiceDetailsId = (item: AMCListItem) =>
+  getNumberValue(item as Record<string, unknown>, [
+    'amcServiceDetailsId',
+    'AMCServiceDetailsId',
+  ]);
+
+const getAMCsId = (item: AMCListItem) =>
+  getNumberValue(item as Record<string, unknown>, [
+    'amCsId',
+    'AMCsId',
+    'id',
+    'Id',
+  ]);
+
+const getContactNo = (item: AMCListItem) =>
+  getStringValue(item as Record<string, unknown>, [
+    'contactNo',
+    'ContactNo',
+    'contact',
+    'Contact',
+    'customerNumber',
+    'CustomerNumber',
+    'mobileNo',
+    'MobileNo',
+  ]);
+
+const formatTimeLabel = (rawTime: string) => {
+  if (!rawTime) {
+    return '';
+  }
+
+  // ActivationTime comes back as a bare "HH:mm:ss" (no date part), which
+  // `new Date(rawTime)` can't parse -- handle it directly first.
+  const bareTimeMatch = rawTime.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (bareTimeMatch) {
+    const hours = Number(bareTimeMatch[1]);
+    const minutes = bareTimeMatch[2];
+    const period = hours >= 12 ? 'PM' : 'AM';
+    const hour12 = hours % 12 || 12;
+    return `${hour12}:${minutes} ${period}`;
+  }
+
+  const date = new Date(rawTime);
+  if (!Number.isNaN(date.getTime())) {
+    return date
+      .toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      })
+      .toUpperCase();
+  }
+
+  return rawTime;
+};
+
+const getCompletedServiceCount = (item: AMCListItem) =>
+  getNumberValue(item as Record<string, unknown>, [
+    'completedServiceCount',
+    'CompletedServiceCount',
+    'currentServiceCount',
+    'CurrentServiceCount',
+    'serviceCount',
+    'ServiceCount',
+    'serviceCompletedCount',
+    'ServiceCompletedCount',
+    'noOfServiceCompleted',
+    'NoOfServiceCompleted',
+    'ServiceNo',
+  ]);
+
+const getTotalServiceCount = (item: AMCListItem) => {
+  const total = getNumberValue(item as Record<string, unknown>, [
+    'totalServiceCount',
+    'TotalServiceCount',
+    'noOfServices',
+    'NoOfServices',
+    'totalServices',
+    'TotalServices',
+    'totalAMCService',
+    'TotalAMCService',
+  ]);
+
+  return total > 0 ? total : 12;
+};
+
+const AMCDashboardScreen = ({
+  ownerId,
+  openAddAmcTrigger,
+  onAddAmcModalClose,
+  modalOnly = false,
+  addAmcPrefill,
+}: AMCDashboardScreenProps) => {
+  const {t} = useTranslation();
+  const navigation = useNavigation<NativeStackNavigationProp<AdminStackParamList>>();
+  const today = useMemo(() => new Date(), []);
+  const monthOptions = useMemo(buildMonthOptions, []);
+  const defaultMonth = monthOptions[today.getMonth()] ?? monthOptions[0];
+  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [items, setItems] = useState<AMCListItem[]>([]);
+  const [amcTypes, setAmcTypes] = useState<AMCTypeOption[]>([
+    { id: 0, name: 'Select AMC Type' },
+  ]);
+  const [selectedType, setSelectedType] = useState<AMCTypeOption>({
+    id: 0,
+    name: 'Select AMC Type',
+  });
+  const [selectedMonth, setSelectedMonth] = useState<MonthOption>(defaultMonth);
+  const [search, setSearch] = useState('');
+  const [typeModalVisible, setTypeModalVisible] = useState(false);
+  const [monthModalVisible, setMonthModalVisible] = useState(false);
+  const [addModalVisible, setAddModalVisible] = useState(false);
+  const [underWarranty, setUnderWarranty] = useState(true);
+  const showReceivedAmount = !underWarranty && !modalOnly;
+  const [activeDateField, setActiveDateField] = useState<AMCDateField | null>(
+    null,
+  );
+  const [timePickerVisible, setTimePickerVisible] = useState(false);
+  const [timePickerMode, setTimePickerMode] = useState<'hour' | 'minute'>('hour');
+  const [activationDate, setActivationDate] = useState<Date | null>(null);
+  const [contractDate, setContractDate] = useState<Date | null>(null);
+  const [expiryDate, setExpiryDate] = useState<Date | null>(null);
+  const [serviceTime, setServiceTime] = useState<Date | null>(null);
+  const [calendarDate, setCalendarDate] = useState(() => new Date());
+  const [selectedCalendarDate, setSelectedCalendarDate] = useState(
+    () => new Date(),
+  );
+  const [selectedClockTime, setSelectedClockTime] = useState(() => new Date());
+  const [occurrenceOptions, setOccurrenceOptions] = useState<
+    AddAMCDropdownOption[]
+  >([]);
+  const [reminderOptions, setReminderOptions] = useState<
+    AddAMCDropdownOption[]
+  >([]);
+  const [selectedServiceCount, setSelectedServiceCount] =
+    useState<AddAMCDropdownOption | null>(null);
+  const [selectedOccurrence, setSelectedOccurrence] =
+    useState<AddAMCDropdownOption | null>(null);
+  const [selectedReminder, setSelectedReminder] =
+    useState<AddAMCDropdownOption | null>(null);
+  const [activeAddDropdown, setActiveAddDropdown] =
+    useState<AddAMCDropdownKind | null>(null);
+  const [amcName, setAmcName] = useState('');
+  const [customerName, setCustomerName] = useState('');
+  const [customerNumber, setCustomerNumber] = useState('');
+  const [customerEmail, setCustomerEmail] = useState('');
+  const [customerAddress, setCustomerAddress] = useState('');
+  const [customerLat, setCustomerLat] = useState('');
+  const [customerLng, setCustomerLng] = useState('');
+  const [placeSearchOpen, setPlaceSearchOpen] = useState(false);
+  const [customerLandmark, setCustomerLandmark] = useState('');
+  const [brandName, setBrandName] = useState('');
+  const [modelName, setModelName] = useState('');
+  const [serialNo, setSerialNo] = useState('');
+  const [note, setNote] = useState('');
+  const [amcAmount, setAmcAmount] = useState('');
+  const [receivedAmount, setReceivedAmount] = useState('');
+  const [selectedCustomerId, setSelectedCustomerId] = useState(0);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [allCustomerOptions, setAllCustomerOptions] = useState<
+    CustomerOption[]
+  >([]);
+  const [customerSuggestions, setCustomerSuggestions] = useState<
+    CustomerOption[]
+  >([]);
+  const [isCustomerLoading, setIsCustomerLoading] = useState(false);
+  const [showCustomerSuggestions, setShowCustomerSuggestions] = useState(false);
+  const [showNumberSuggestions, setShowNumberSuggestions] = useState(false);
+  const latestRequestId = useRef(0);
+  const latestCustomerRequestId = useRef(0);
+
+  const {openContacts, contactPickerModal} = useContactPicker(contact => {
+    setCustomerNumber(contact.phone);
+    setShowNumberSuggestions(false);
+    if (!customerName.trim()) {
+      setCustomerName(contact.name);
+    }
+  });
+
+  const serviceCountOptions = useMemo(
+    () =>
+      Array.from({ length: 20 }, (_, index) => ({
+        id: index + 1,
+        name: String(index + 1),
+      })),
+    [],
+  );
+
+  const loadAMCTypes = useCallback(async () => {
+    try {
+      const response = await getAmcTypeList();
+      const options = getResultData(response)
+        .map(normalizeAMCType)
+        .filter((option): option is AMCTypeOption => {
+          return Boolean(
+            option &&
+              option.id !== 1 &&
+              option.name.toLowerCase() !== 'completed',
+          );
+        });
+
+      setAmcTypes([{ id: 0, name: 'Select AMC Type' }, ...options]);
+    } catch (error) {
+      console.warn('[AMC Type Error]', error);
+    }
+  }, []);
+
+  const loadAMCFormLookups = useCallback(async () => {
+    try {
+      const [occurrenceResponse, reminderResponse] = await Promise.all([
+        getServiceOccurrenceList(),
+        getReminderModeList(),
+      ]);
+
+      setOccurrenceOptions(
+        getResultData(occurrenceResponse)
+          .map(normalizeLookupOption)
+          .filter((option): option is AddAMCDropdownOption => Boolean(option)),
+      );
+      setReminderOptions(
+        getResultData(reminderResponse)
+          .map(normalizeLookupOption)
+          .filter((option): option is AddAMCDropdownOption => Boolean(option)),
+      );
+    } catch (error) {
+      console.warn('[AMC Form Lookup Error]', error);
+    }
+  }, []);
+
+  const loadAMCList = useCallback(
+    async (refresh = false) => {
+      const requestId = latestRequestId.current + 1;
+      latestRequestId.current = requestId;
+
+      if (refresh) {
+        setRefreshing(true);
+      } else {
+        setLoading(true);
+      }
+
+      try {
+        const response = await getAmcServiceMonthList({
+          OwnerId: ownerId || getCurrentUserId(),
+          Date: formatDateForApi(
+            selectedMonth.month,
+            today.getDate(),
+            selectedMonth.year,
+          ),
+          AMCTypeId: selectedType.id,
+        });
+
+        if (latestRequestId.current !== requestId) {
+          return;
+        }
+
+        const amcData = getResultData(response);
+        setItems(amcData);
+      } catch (error) {
+        if (latestRequestId.current !== requestId) {
+          return;
+        }
+
+        const message =
+          error instanceof Error ? error.message : 'Unable to load AMC data.';
+        showFailureMsg(message || 'AMC Error');
+        setItems([]);
+      } finally {
+        if (latestRequestId.current === requestId) {
+          setLoading(false);
+          setRefreshing(false);
+        }
+      }
+    },
+    [ownerId, selectedMonth.month, selectedMonth.year, selectedType.id, today],
+  );
+
+  const loadCustomerSuggestions = useCallback(
+    async (query: string) => {
+      const trimmedQuery = query.trim();
+      if (trimmedQuery.length < 2) {
+        setCustomerSuggestions([]);
+        setIsCustomerLoading(false);
+        return;
+      }
+
+      if (allCustomerOptions.length > 0) {
+        const localMatches = filterCustomerOptions(allCustomerOptions, trimmedQuery);
+        if (localMatches.length > 0) {
+          setCustomerSuggestions(localMatches);
+          setIsCustomerLoading(false);
+          return;
+        }
+      }
+
+      const requestId = latestCustomerRequestId.current + 1;
+      latestCustomerRequestId.current = requestId;
+      setIsCustomerLoading(true);
+
+      try {
+        const response =
+          await getCustomerList({
+            UserId: ownerId || getCurrentUserId(),
+            CustomerTagId: 0,
+            SearchParam: trimmedQuery,
+          });
+
+        if (latestCustomerRequestId.current !== requestId) {
+          return;
+        }
+
+        let normalized = getResultData(response)
+          .map(normalizeCustomerOption)
+          .filter((option): option is CustomerOption => Boolean(option));
+
+        if (normalized.length === 0) {
+          const fallbackResponse =
+            await getCustomerList({
+              UserId: ownerId || getCurrentUserId(),
+              CustomerTagId: 0,
+            });
+
+          if (latestCustomerRequestId.current !== requestId) {
+            return;
+          }
+
+          normalized = getResultData(fallbackResponse)
+            .map(normalizeCustomerOption)
+            .filter((option): option is CustomerOption => Boolean(option));
+        }
+
+        setAllCustomerOptions(normalized);
+        setCustomerSuggestions(filterCustomerOptions(normalized, trimmedQuery));
+      } catch (error) {
+        if (latestCustomerRequestId.current === requestId) {
+          console.warn('[AMC Customer Lookup Error]', error);
+          setCustomerSuggestions([]);
+        }
+      } finally {
+        if (latestCustomerRequestId.current === requestId) {
+          setIsCustomerLoading(false);
+        }
+      }
+    },
+    [allCustomerOptions, ownerId],
+  );
+
+  // Typing a customer number suggests saved customers whose number contains the digits typed;
+  // picking one autofills the whole form, exactly like picking by name.
+  const numberSuggestions = useMemo(() => {
+    const digits = customerNumber.replace(/\D/g, '');
+    if (!showNumberSuggestions || digits.length < 3) {
+      return [];
+    }
+    return allCustomerOptions
+      .filter(option => option.phone.replace(/\D/g, '').includes(digits))
+      .slice(0, 20);
+  }, [allCustomerOptions, customerNumber, showNumberSuggestions]);
+
+  const resetAddAMCForm = () => {
+    setAmcName('');
+    setCustomerName('');
+    setCustomerNumber('');
+    setCustomerEmail('');
+    setCustomerAddress('');
+    setCustomerLat('');
+    setCustomerLng('');
+    setCustomerLandmark('');
+    setBrandName('');
+    setModelName('');
+    setSerialNo('');
+    setNote('');
+    setAmcAmount('');
+    setReceivedAmount('');
+    setSelectedCustomerId(0);
+    setUnderWarranty(true);
+    setActivationDate(null);
+    setContractDate(null);
+    setExpiryDate(null);
+    setServiceTime(null);
+    setSelectedServiceCount(null);
+    setSelectedOccurrence(null);
+    setSelectedReminder(null);
+    setActiveAddDropdown(null);
+    setShowCustomerSuggestions(false);
+  };
+
+  const handleSubmitAddAMC = async () => {
+    if (isSubmitting) {
+      return;
+    }
+
+    const owner = ownerId || getCurrentUserId();
+
+    if (!amcName.trim()) {
+      showFailureMsg(t('please_enter_amc_name'));
+      return;
+    }
+
+    if (!customerName.trim()) {
+      showFailureMsg(t('please_enter_cust_name'));
+      return;
+    }
+
+    if (!customerNumber.trim()) {
+      showFailureMsg(t('please_enter_cust_number'));
+      return;
+    }
+
+    if (!customerAddress.trim()) {
+      showFailureMsg(t('please_enter_address'));
+      return;
+    }
+
+    if (!customerLandmark.trim()) {
+      showFailureMsg(t('please_enter_landmark'));
+      return;
+    }
+
+    if (!brandName.trim()) {
+      showFailureMsg(t('rn_please_enter_brand_name'));
+      return;
+    }
+
+    if (!modelName.trim()) {
+      showFailureMsg(t('rn_please_enter_model_name'));
+      return;
+    }
+
+    if (!serialNo.trim()) {
+      showFailureMsg(t('rn_please_enter_serial_no'));
+      return;
+    }
+
+    if (!activationDate) {
+      showFailureMsg(t('rn_please_select_activation_date'));
+      return;
+    }
+
+    if (!contractDate) {
+      showFailureMsg(t('rn_please_select_contract_date'));
+      return;
+    }
+
+    if (!serviceTime) {
+      showFailureMsg(t('rn_please_select_service_time'));
+      return;
+    }
+
+    if (!selectedServiceCount) {
+      showFailureMsg(t('rn_please_select_number_of_services'));
+      return;
+    }
+
+    if (!selectedOccurrence) {
+      showFailureMsg(t('rn_please_select_occurrence'));
+      return;
+    }
+
+    // Same rules as Java's AMCDialog: amount is required when the product is
+    // out of warranty, and the received amount can't exceed it.
+    // Amount fields are hidden under warranty, so don't send stale values.
+    const amcAmountValue = underWarranty ? 0 : Number(amcAmount) || 0;
+    const receivedAmountValue = showReceivedAmount ? Number(receivedAmount) || 0 : 0;
+    if (!underWarranty && !amcAmount.trim()) {
+      showFailureMsg(t('rn_please_enter_service_amount'));
+      return;
+    }
+    if (receivedAmountValue > amcAmountValue) {
+      showFailureMsg(t('rn_received_amount_cannot_be_greater_than_ser'));
+      return;
+    }
+
+    try {
+      setIsSubmitting(true);
+      ensureSuccess(await addAmc({
+        AMCAmount: amcAmountValue,
+        AMCName: amcName.trim(),
+        AMCNotes: note.trim(),
+        AMCSetReminderId: selectedReminder ? Number(selectedReminder.id) : 0,
+        AMCsId: 0,
+        ActivationDate: formatDateForAddAMC(
+          activationDate.getMonth() + 1,
+          activationDate.getDate(),
+          activationDate.getFullYear(),
+        ),
+        ActivationTime: formatTimeForAddAMC(serviceTime),
+        ContractDate: formatDateForAddAMC(
+          contractDate.getMonth() + 1,
+          contractDate.getDate(),
+          contractDate.getFullYear(),
+        ),
+        CreatedBy: owner,
+        ExpiryDate: expiryDate
+          ? formatDateForAddAMC(
+              expiryDate.getMonth() + 1,
+              expiryDate.getDate(),
+              expiryDate.getFullYear(),
+            )
+          : undefined,
+        ProductDetail: {
+          CreatedBy: owner,
+          CustomerDetail: {
+            CreatedBy: owner,
+            CustomerDetailsid: selectedCustomerId,
+            CustomerName: customerName.trim(),
+            EmailId: customerEmail.trim(),
+            IsActive: true,
+            LocationId: 0,
+            MobileNumber: customerNumber.trim(),
+            OwnerId: owner,
+            UpdatedBy: owner,
+            UserId: owner,
+          },
+          CustomerId: 0,
+          CustomerLocationId: 0,
+          Location: {
+            Address: customerAddress.trim(),
+            CreatedBy: owner,
+            Description: customerLandmark.trim(),
+            Id: 0,
+            IsActive: true,
+            Longitude: customerLng,
+            Name: '',
+            PinCode: '', // editText_pin_code is 'gone' in dialog_add_amc_new.xml
+            UpdatedBy: owner,
+            latitude: customerLat,
+          },
+          ProductBrand: brandName.trim(),
+          ProductDetailsId: 0,
+          ProductName: modelName.trim(),
+          ProductSerialNo: serialNo.trim(),
+          UnderWarranty: underWarranty,
+          UpdatedBy: owner,
+          UserId: owner,
+        },
+        ProductId: 0,
+        ReceivedAmount: receivedAmountValue,
+        ServiceOccuranceId: Number(selectedOccurrence.id),
+        TotalServices: Number(selectedServiceCount.name),
+        UpdatedBy: owner,
+        UserId: owner,
+      }));
+
+      showSuccessMsg(t('rn_amc_added_successfully'));
+      setAddModalVisible(false);
+      onAddAmcModalClose?.();
+      resetAddAMCForm();
+      loadAMCList(true);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Unable to add AMC.';
+      showFailureMsg(message || 'AMC Error');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const preloadCustomers = useCallback(async () => {
+    if (allCustomerOptions.length > 0 || isCustomerLoading) {
+      return;
+    }
+
+    const requestId = latestCustomerRequestId.current + 1;
+    latestCustomerRequestId.current = requestId;
+    setIsCustomerLoading(true);
+
+    try {
+      const response =
+        await getCustomerList({
+          UserId: ownerId || getCurrentUserId(),
+          CustomerTagId: 0,
+          SearchParam: customerName,
+        });
+
+      if (latestCustomerRequestId.current !== requestId) {
+        return;
+      }
+
+      const normalized = getResultData(response)
+        .map(normalizeCustomerOption)
+        .filter((option): option is CustomerOption => Boolean(option));
+      setAllCustomerOptions(normalized);
+      setCustomerSuggestions(filterCustomerOptions(normalized, customerName));
+    } catch (error) {
+      if (latestCustomerRequestId.current === requestId) {
+        console.warn('[AMC Customer Lookup Error]', error);
+      }
+    } finally {
+      if (latestCustomerRequestId.current === requestId) {
+        setIsCustomerLoading(false);
+      }
+    }
+  }, [allCustomerOptions.length, customerName, isCustomerLoading, ownerId]);
+
+  useEffect(() => {
+    loadAMCTypes();
+  }, [loadAMCTypes]);
+
+  useEffect(() => {
+    loadAMCFormLookups();
+  }, [loadAMCFormLookups]);
+
+  useEffect(() => {
+    if (modalOnly) {
+      return;
+    }
+    loadAMCList();
+  }, [loadAMCList, modalOnly]);
+
+  useEffect(() => {
+    if (addModalVisible) {
+      preloadCustomers();
+    }
+  }, [addModalVisible, preloadCustomers]);
+
+  useEffect(() => {
+    if (openAddAmcTrigger) {
+      setAddModalVisible(true);
+      if (addAmcPrefill) {
+        // Java addAMCFromQuoteDialog: customer block, AMC name = quote name, amount = grand total
+        // (paid AMC, so the amount fields show), activation date / time = the quote's created date.
+        setAmcName(addAmcPrefill.name);
+        setCustomerName(addAmcPrefill.customerName);
+        setCustomerNumber(addAmcPrefill.customerNumber);
+        setCustomerAddress(addAmcPrefill.address);
+        setCustomerLandmark(addAmcPrefill.landmark);
+        setCustomerLat(addAmcPrefill.latitude);
+        setCustomerLng(addAmcPrefill.longitude);
+        setSelectedCustomerId(addAmcPrefill.customerId ?? 0);
+        setAmcAmount(String(Math.round(addAmcPrefill.amount)));
+        setUnderWarranty(false);
+        const created = new Date(addAmcPrefill.createdDate);
+        if (!Number.isNaN(created.getTime())) {
+          setActivationDate(created);
+          setServiceTime(created);
+        }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openAddAmcTrigger]);
+
+  useEffect(() => {
+    const query = customerName.trim();
+    if (!showCustomerSuggestions || query.length < 2) {
+      setCustomerSuggestions([]);
+      setIsCustomerLoading(false);
+      return;
+    }
+
+    if (allCustomerOptions.length > 0) {
+      setCustomerSuggestions(filterCustomerOptions(allCustomerOptions, query));
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      loadCustomerSuggestions(query);
+    }, 350);
+
+    return () => clearTimeout(timeoutId);
+  }, [
+    allCustomerOptions,
+    customerName,
+    loadCustomerSuggestions,
+    showCustomerSuggestions,
+  ]);
+
+  useEffect(() => {
+    setExpiryDate(
+      calculateAMCExpiryDate(
+        activationDate,
+        selectedServiceCount,
+        selectedOccurrence,
+      ),
+    );
+  }, [activationDate, selectedOccurrence, selectedServiceCount]);
+
+  const filtered = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    if (!query) {
+      return items;
+    }
+
+    return items.filter(item => {
+      const searchable = [
+        getAMCTitle(item),
+        getAMCName(item),
+        getAMCServiceType(item),
+        getAMCFieldWorker(item),
+        getAMCTaskId(item),
+        getAMCRawDate(item),
+        getAMCTime(item),
+      ]
+        .join(' ')
+        .toLowerCase();
+      return searchable.includes(query);
+    });
+  }, [items, search]);
+
+  const renderAMCItem = ({item}: {item: AMCListItem}) => {
+    const itemAmcName = getAMCName(item);
+    const serviceType = getAMCServiceType(item);
+    const fieldWorker = getAMCFieldWorker(item);
+    const taskId = getAMCTaskId(item);
+    const date = formatListDate(getAMCRawDate(item));
+    const completedCount = getCompletedServiceCount(item);
+    const totalCount = getTotalServiceCount(item);
+
+    const handleAMCPress = () => {
+      const amcServiceDetailsId = getAMCServiceDetailsId(item);
+      const amcsId = getAMCsId(item);
+      const owner = ownerId || getCurrentUserId();
+      // Navigate to AMC details screen with the selected item and IDs
+      navigation.navigate('AMCDetails', { 
+        amcItem: item as Record<string, unknown>,
+        amcServiceDetailsId,
+        amcsId,
+        ownerId: owner,
+      });
+    };
+
+    return (
+      <Pressable style={styles.card} onPress={handleAMCPress}>
+        <Text style={styles.timeText}>
+          {formatTimeLabel(getAMCTime(item))}
+        </Text>
+
+        <View style={styles.cardSurface}>
+        <View style={[styles.timeline, {backgroundColor: getAMCStatusColor(item)}]} />
+        <View style={styles.cardBody}>
+          <View style={styles.cardTopRow}>
+            <View style={styles.titleBlock}>
+              <Text numberOfLines={1} style={styles.typeText}>
+                {itemAmcName || 'AMC'}
+              </Text>
+              <Text numberOfLines={1} style={styles.customerText}>
+                {getAMCTitle(item)}
+              </Text>
+              <View style={styles.serviceRow}>
+                <Text style={styles.serviceLabel}>{t('service_type')}</Text>
+                <Text numberOfLines={1} style={styles.serviceValue}>
+                  {serviceType ? `  ${serviceType}` : ''}
+                </Text>
+              </View>
+            </View>
+            <View style={styles.countBlock}>
+              <Text style={styles.dateText}>{date}</Text>
+              <Text style={styles.countText}>
+                {completedCount}
+                <Text style={styles.countSlash}>/</Text>
+                <Text style={styles.countTotal}>{totalCount}</Text>
+              </Text>
+            </View>
+          </View>
+
+          {fieldWorker || taskId ? (
+            <View style={styles.metaRow}>
+              {fieldWorker ? (
+                <>
+                  <Text style={styles.metaLabel}>{t('technician_title')}</Text>
+                  <Text numberOfLines={1} style={styles.metaValue}>
+                    {fieldWorker}
+                  </Text>
+                </>
+              ) : null}
+              {taskId ? (
+                <>
+                  <Text style={styles.taskLabel}>{t('task_id_title')}</Text>
+                  <Text numberOfLines={1} style={styles.taskValue}>
+                    {taskId}
+                  </Text>
+                </>
+              ) : null}
+            </View>
+          ) : null}
+        </View>
+        </View>
+      </Pressable>
+    );
+  };
+
+  const renderPickerModal = (
+    visible: boolean,
+    title: string,
+    onClose: () => void,
+    children: React.ReactNode,
+  ) => (
+    <Modal
+      transparent
+      animationType="fade"
+      visible={visible}
+      onRequestClose={onClose}
+    >
+      <Pressable style={styles.modalBackdrop} onPress={onClose}>
+        <Pressable style={styles.modalPanel} onPress={() => {}}>
+          <Text style={styles.modalTitle}>{title}</Text>
+          {children}
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+
+  const renderFormInput = (
+    placeholder: string,
+    options: {
+      half?: boolean;
+      trailing?: React.ReactNode;
+      value?: string;
+      onChangeText?: (text: string) => void;
+      onFocus?: () => void;
+      editable?: boolean;
+      keyboardType?: 'default' | 'email-address' | 'phone-pad' | 'decimal-pad' | 'number-pad';
+      maxLength?: number;
+      autoCapitalize?: 'none' | 'sentences' | 'words' | 'characters';
+    } = {},
+  ) => (
+    <View
+      style={[styles.formInputShell, options.half ? styles.formHalf : null]}
+    >
+      {options.keyboardType === 'decimal-pad' ? (
+        // amounts: 0.000 placeholder, max 3 decimals, padded on blur (the label floats permanently)
+        <DecimalInput
+          style={styles.formInput}
+          value={options.value}
+          onChangeText={options.onChangeText}
+          onFocus={options.onFocus}
+        />
+      ) : (
+        <TextInput
+          style={styles.formInput}
+          placeholder={placeholder}
+          placeholderTextColor={COLORS.lightGray}
+          value={options.value}
+          onChangeText={options.onChangeText}
+          onFocus={options.onFocus}
+          editable={options.editable}
+          keyboardType={options.keyboardType ?? 'default'}
+          inputAccessoryViewID={numpadAccessoryId(options.keyboardType ?? 'default')}
+          maxLength={options.maxLength}
+          autoCapitalize={options.autoCapitalize ?? 'sentences'}
+        />
+      )}
+      {options.trailing ? (
+        <View style={styles.formTrailing}>{options.trailing}</View>
+      ) : null}
+      {/* Java's outlined TextInputLayout floats the hint onto the border once filled. */}
+      {options.value || options.keyboardType === 'decimal-pad' ? <Text style={styles.formFloatLabel}>{placeholder}</Text> : null}
+    </View>
+  );
+
+  const renderPickerInput = (
+    placeholder: string,
+    value: string,
+    onPress: () => void,
+    options: { half?: boolean; trailing?: React.ReactNode } = {},
+  ) => (
+    <Pressable
+      style={[styles.formInputShell, options.half ? styles.formHalf : null]}
+      onPress={onPress}
+    >
+      <Text
+        numberOfLines={1}
+        style={[styles.formSelectText, value ? styles.formValueText : null]}
+      >
+        {value || placeholder}
+      </Text>
+      {options.trailing ? (
+        <View style={styles.formTrailing}>{options.trailing}</View>
+      ) : null}
+      {value ? <Text style={styles.formFloatLabel}>{placeholder}</Text> : null}
+    </Pressable>
+  );
+
+  const renderSelectField = (
+    placeholder: string,
+    value: string,
+    onPress: () => void,
+    half = false,
+  ) => (
+    <Pressable
+      style={[styles.formInputShell, half ? styles.formHalf : null]}
+      onPress={onPress}
+    >
+      <Text
+        numberOfLines={1}
+        style={[styles.formSelectText, value ? styles.formValueText : null]}
+      >
+        {value || placeholder}
+      </Text>
+      <Ionicons name="chevron-down" style={styles.formSelectArrow} />
+    </Pressable>
+  );
+
+  const openAddDropdown = (kind: AddAMCDropdownKind) => {
+    setActiveAddDropdown(kind);
+  };
+
+  const getActiveAddDropdownConfig = () => {
+    if (activeAddDropdown === 'services') {
+      return {
+        title: tr('Select No. of Services'),
+        options: serviceCountOptions,
+        selected: selectedServiceCount,
+      };
+    }
+    if (activeAddDropdown === 'occurrence') {
+      return {
+        title: tr('Select Occurrence'),
+        options: occurrenceOptions,
+        selected: selectedOccurrence,
+      };
+    }
+    return {
+      title: tr('Select Reminder'),
+      options: reminderOptions,
+      selected: selectedReminder,
+    };
+  };
+
+  const handleAddDropdownSelect = (option: AddAMCDropdownOption) => {
+    if (activeAddDropdown === 'services') {
+      setSelectedServiceCount(option);
+    } else if (activeAddDropdown === 'occurrence') {
+      setSelectedOccurrence(option);
+    } else if (activeAddDropdown === 'reminder') {
+      setSelectedReminder(option);
+    }
+
+    setActiveAddDropdown(null);
+  };
+
+  const handleCustomerSelect = (customer: CustomerOption) => {
+    setSelectedCustomerId(customer.id);
+    setCustomerName(customer.name);
+    setCustomerNumber(customer.phone);
+    setCustomerEmail(customer.email);
+    setCustomerAddress(customer.address);
+    setCustomerLat('');
+    setCustomerLng('');
+    setCustomerLandmark(customer.landmark);
+    setBrandName(customer.brandName);
+    setModelName(customer.modelName);
+    setSerialNo(normalizeSerialNo(customer.serialNo));
+    setCustomerSuggestions([]);
+    setShowCustomerSuggestions(false);
+    setShowNumberSuggestions(false);
+  };
+
+  const renderNumberSuggestions = () => {
+    if (numberSuggestions.length === 0) {
+      return null;
+    }
+    return (
+      <View style={styles.customerSuggestionPanel}>
+        <ScrollView
+          keyboardShouldPersistTaps="handled"
+          nestedScrollEnabled
+          style={styles.customerSuggestionList}
+        >
+          {numberSuggestions.map(customer => (
+            <Pressable
+              key={`${customer.id}-${customer.phone}`}
+              style={styles.customerSuggestionItem}
+              onPress={() => handleCustomerSelect(customer)}
+            >
+              <Text numberOfLines={1} style={styles.customerSuggestionName}>
+                {customer.phone}
+              </Text>
+              <Text numberOfLines={1} style={styles.customerSuggestionMeta}>
+                {customer.name}
+              </Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      </View>
+    );
+  };
+
+  const renderCustomerSuggestions = () => {
+    const shouldShow =
+      showCustomerSuggestions &&
+      customerName.trim().length >= 2 &&
+      (isCustomerLoading || customerSuggestions.length > 0);
+
+    if (!shouldShow) {
+      return null;
+    }
+
+    return (
+      <View style={styles.customerSuggestionPanel}>
+        {isCustomerLoading ? (
+          <View style={styles.customerSuggestionStatus}>
+            <ActivityIndicator color={THEME_PRIMARY} size="small" />
+            <Text style={styles.customerSuggestionStatusText}>
+              {t('rn_loading_customers')}
+            </Text>
+          </View>
+        ) : (
+          <ScrollView
+            keyboardShouldPersistTaps="handled"
+            nestedScrollEnabled
+            style={styles.customerSuggestionList}
+          >
+            {customerSuggestions.map(customer => (
+              <Pressable
+                key={`${customer.id}-${customer.name}`}
+                style={styles.customerSuggestionItem}
+                onPress={() => handleCustomerSelect(customer)}
+              >
+                <Text numberOfLines={1} style={styles.customerSuggestionName}>
+                  {customer.name}
+                </Text>
+                {customer.phone ? (
+                  <Text numberOfLines={1} style={styles.customerSuggestionMeta}>
+                    {customer.phone}
+                  </Text>
+                ) : null}
+              </Pressable>
+            ))}
+          </ScrollView>
+        )}
+      </View>
+    );
+  };
+
+  // Java AMCDialog: dialog_searchable_spinner_occurence / _reminder -- the shared dialog.
+  const renderAddDropdownModal = () => {
+    if (!activeAddDropdown) {
+      return null;
+    }
+
+    const config = getActiveAddDropdownConfig();
+
+    return (
+      <SearchPickerModal
+        visible
+        title={config.title}
+        options={config.options.map(option => ({id: option.id, label: option.name}))}
+        onSelect={picked => {
+          const option = config.options.find(
+            o => o.id === picked.id && o.name === picked.label,
+          );
+          if (option) {
+            handleAddDropdownSelect(option);
+          }
+        }}
+        onClose={() => setActiveAddDropdown(null)}
+      />
+    );
+  };
+
+  const openDatePicker = (field: AMCDateField) => {
+    const existingDate =
+      field === 'activation'
+        ? activationDate
+        : field === 'contract'
+        ? contractDate
+        : expiryDate;
+    const nextDate = existingDate ?? new Date();
+    setActiveDateField(field);
+    setCalendarDate(nextDate);
+    setSelectedCalendarDate(nextDate);
+  };
+
+  const confirmDatePicker = () => {
+    if (activeDateField === 'activation') {
+      setActivationDate(selectedCalendarDate);
+    } else if (activeDateField === 'contract') {
+      setContractDate(selectedCalendarDate);
+    } else if (activeDateField === 'expiry') {
+      setExpiryDate(selectedCalendarDate);
+    }
+
+    setActiveDateField(null);
+  };
+
+  const openTimePicker = () => {
+    const nextTime = serviceTime ?? new Date();
+    setSelectedClockTime(nextTime);
+    setTimePickerMode('hour');
+    setTimePickerVisible(true);
+  };
+
+  const confirmTimePicker = () => {
+    // Java DateUtils.timePicker stores the picked time with ":00" seconds.
+    const picked = new Date(selectedClockTime);
+    picked.setSeconds(0, 0);
+    setServiceTime(picked);
+    setTimePickerVisible(false);
+  };
+
+  const setClockHour = (hour: number) => {
+    const nextTime = new Date(selectedClockTime);
+    const isPM = nextTime.getHours() >= 12;
+    nextTime.setHours((hour % 12) + (isPM ? 12 : 0));
+    setSelectedClockTime(nextTime);
+  };
+
+  const setClockMinute = (minute: number) => {
+    const nextTime = new Date(selectedClockTime);
+    nextTime.setMinutes(minute);
+    setSelectedClockTime(nextTime);
+  };
+
+  // Like the Android clock: picking an hour moves on to picking minutes.
+  const selectClockHour = (hour: number) => {
+    setClockHour(hour);
+    setTimePickerMode('minute');
+  };
+
+  const toggleClockPeriod = (period: 'AM' | 'PM') => {
+    const nextTime = new Date(selectedClockTime);
+    const hour = nextTime.getHours();
+    if (period === 'AM' && hour >= 12) {
+      nextTime.setHours(hour - 12);
+    } else if (period === 'PM' && hour < 12) {
+      nextTime.setHours(hour + 12);
+    }
+    setSelectedClockTime(nextTime);
+  };
+
+  const renderCalendarDialog = () => {
+    const visible = activeDateField !== null;
+    const month = calendarDate.getMonth();
+    const year = calendarDate.getFullYear();
+    const days = buildCalendarDays(month, year);
+    const dayNames = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+
+    return (
+      <Modal
+        transparent
+        animationType="fade"
+        visible={visible}
+        onRequestClose={() => setActiveDateField(null)}
+      >
+        <View style={styles.pickerOverlay}>
+          <View style={styles.dateDialog}>
+            <View style={styles.dateDialogHeader}>
+              <Text style={styles.dateDialogYear}>{year}</Text>
+              <Text style={styles.dateDialogTitle}>
+                {selectedCalendarDate.toLocaleDateString('en-GB', {
+                  weekday: 'short',
+                  day: 'numeric',
+                  month: 'short',
+                })}
+              </Text>
+            </View>
+            <View style={styles.calendarBody}>
+              <View style={styles.calendarMonthRow}>
+                <Pressable
+                  hitSlop={10}
+                  onPress={() => setCalendarDate(new Date(year, month - 1, 1))}
+                >
+                  <Text style={styles.calendarNav}>‹</Text>
+                </Pressable>
+                <Text style={styles.calendarMonthText}>
+                  {MONTH_LABELS[month]} {year}
+                </Text>
+                <Pressable
+                  hitSlop={10}
+                  onPress={() => setCalendarDate(new Date(year, month + 1, 1))}
+                >
+                  <Text style={styles.calendarNav}>›</Text>
+                </Pressable>
+              </View>
+
+              <View style={styles.calendarGrid}>
+                {dayNames.map((dayName, index) => (
+                  <Text key={`${dayName}-${index}`} style={styles.weekdayText}>
+                    {dayName}
+                  </Text>
+                ))}
+                {days.map((day, index) => {
+                  const selected =
+                    day > 0 &&
+                    selectedCalendarDate.getDate() === day &&
+                    selectedCalendarDate.getMonth() === month &&
+                    selectedCalendarDate.getFullYear() === year;
+                  return (
+                    <Pressable
+                      key={`${day}-${index}`}
+                      disabled={!day}
+                      style={styles.calendarDay}
+                      onPress={() =>
+                        setSelectedCalendarDate(new Date(year, month, day))
+                      }
+                    >
+                      <View
+                        style={[
+                          styles.calendarDayInner,
+                          selected ? styles.calendarDaySelected : null,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.calendarDayText,
+                            selected ? styles.calendarDayTextSelected : null,
+                          ]}
+                        >
+                          {day || ''}
+                        </Text>
+                      </View>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
+              <View style={styles.dialogActionRow}>
+                <Pressable onPress={() => setActiveDateField(null)}>
+                  <Text style={styles.dialogActionText}>{t('cancel').toUpperCase()}</Text>
+                </Pressable>
+                <Pressable onPress={confirmDatePicker}>
+                  <Text style={styles.dialogActionText}>{t('qr_code_positive_button_know')}</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  const renderTimeDialog = () => {
+    const clockSize = ms(256);
+    const clockRadius = ms(104);
+    const center = clockSize / 2;
+    const bubbleSize = ms(40);
+    const isHourMode = timePickerMode === 'hour';
+    const hour12 = selectedClockTime.getHours() % 12 || 12;
+    const minute = selectedClockTime.getMinutes();
+    const minuteStep = (Math.round(minute / 5) * 5) % 60;
+    const period = selectedClockTime.getHours() >= 12 ? 'PM' : 'AM';
+    const faceValues = isHourMode
+      ? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      : [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55];
+    const selectedValue = isHourMode ? hour12 : minuteStep;
+
+    // Hour 12 and minute 0 both sit at the top of the face.
+    const angleFor = (value: number) => {
+      const fraction = isHourMode ? (value % 12) / 12 : value / 60;
+      return fraction * Math.PI * 2 - Math.PI / 2;
+    };
+    const pointFor = (angle: number, radius: number) => ({
+      x: center + Math.cos(angle) * radius,
+      y: center + Math.sin(angle) * radius,
+    });
+    const selectedAngle = angleFor(selectedValue);
+    // Solid hand from the centre to the selected number. A bar is rotated
+    // about its own middle, so it is placed with its middle on the hand's
+    // midpoint and turned to the selected angle.
+    const handLength = clockRadius;
+    const handMid = pointFor(selectedAngle, handLength / 2);
+    const handAngleDeg = (selectedAngle * 180) / Math.PI;
+
+    return (
+      <Modal
+        transparent
+        animationType="fade"
+        visible={timePickerVisible}
+        onRequestClose={() => setTimePickerVisible(false)}
+      >
+        <View style={styles.pickerOverlay}>
+          <View style={styles.timeDialog}>
+            <View style={styles.timeDialogHeader}>
+              <View style={styles.timeDisplayRow}>
+                <Pressable hitSlop={8} onPress={() => setTimePickerMode('hour')}>
+                  <Text
+                    style={[
+                      styles.timeDisplay,
+                      !isHourMode ? styles.timeDisplayInactive : null,
+                    ]}
+                  >
+                    {hour12}
+                  </Text>
+                </Pressable>
+                <Text style={[styles.timeDisplay, styles.timeDisplayColon]}>:</Text>
+                <Pressable hitSlop={8} onPress={() => setTimePickerMode('minute')}>
+                  <Text
+                    style={[
+                      styles.timeDisplay,
+                      isHourMode ? styles.timeDisplayInactive : null,
+                    ]}
+                  >
+                    {String(minute).padStart(2, '0')}
+                  </Text>
+                </Pressable>
+              </View>
+              <View style={styles.periodColumn}>
+                <Pressable hitSlop={6} onPress={() => toggleClockPeriod('AM')}>
+                  <Text
+                    style={[
+                      styles.periodText,
+                      period === 'AM' ? styles.periodTextActive : null,
+                    ]}
+                  >
+                    {t('am')}
+                  </Text>
+                </Pressable>
+                <Pressable hitSlop={6} onPress={() => toggleClockPeriod('PM')}>
+                  <Text
+                    style={[
+                      styles.periodText,
+                      period === 'PM' ? styles.periodTextActive : null,
+                    ]}
+                  >
+                    {t('pm')}
+                  </Text>
+                </Pressable>
+              </View>
+            </View>
+
+            <View style={styles.clockBody}>
+              <View
+                style={[
+                  styles.clockFace,
+                  {width: clockSize, height: clockSize, borderRadius: clockSize / 2},
+                ]}
+              >
+                <View
+                  style={[
+                    styles.clockHand,
+                    {
+                      width: handLength,
+                      left: handMid.x - handLength / 2,
+                      top: handMid.y - ms(1),
+                      transform: [{rotate: `${handAngleDeg}deg`}],
+                    },
+                  ]}
+                />
+                <View
+                  style={[
+                    styles.clockCenterDot,
+                    {left: center - ms(4), top: center - ms(4)},
+                  ]}
+                />
+                {faceValues.map(value => {
+                  const point = pointFor(angleFor(value), clockRadius);
+                  const selected = value === selectedValue;
+                  return (
+                    <Pressable
+                      key={`${timePickerMode}-${value}`}
+                      onPress={() =>
+                        isHourMode ? selectClockHour(value) : setClockMinute(value)
+                      }
+                      style={[
+                        styles.clockNumber,
+                        {
+                          left: point.x - bubbleSize / 2,
+                          top: point.y - bubbleSize / 2,
+                          width: bubbleSize,
+                          height: bubbleSize,
+                          borderRadius: bubbleSize / 2,
+                        },
+                        selected ? styles.clockNumberSelected : null,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.clockNumberText,
+                          selected ? styles.clockNumberTextSelected : null,
+                        ]}
+                      >
+                        {isHourMode ? value : String(value).padStart(2, '0')}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
+              <View style={styles.timeActionRow}>
+                <View style={styles.timeActionButtons}>
+                  <Pressable onPress={() => setTimePickerVisible(false)}>
+                    <Text style={styles.dialogActionText}>{t('cancel').toUpperCase()}</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => {
+                      confirmTimePicker();
+                    }}
+                  >
+                    <Text style={styles.dialogActionText}>{t('qr_code_positive_button_know')}</Text>
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  const renderAddAMCModal = () => (
+    <Modal
+      transparent
+      animationType="slide"
+      visible={addModalVisible}
+      onRequestClose={() => {
+        setAddModalVisible(false);
+        onAddAmcModalClose?.();
+      }}
+    >
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        style={styles.addModalRoot}
+      >
+        <View style={styles.addModalPanel}>
+          <View style={styles.addModalHeader}>
+            <Text style={styles.addModalTitle}>{t('add_amc')}</Text>
+            <Pressable
+              hitSlop={10}
+              onPress={() => {
+                setAddModalVisible(false);
+                onAddAmcModalClose?.();
+                resetAddAMCForm();
+              }}
+              style={styles.addModalClose}
+            >
+              <Ionicons name="close" size={ms(26)} color="#FFFFFF" />
+            </Pressable>
+          </View>
+
+          <ScrollView
+            style={styles.addFormScroll}
+            contentContainerStyle={styles.addFormContent}
+            keyboardShouldPersistTaps="handled"
+          >
+            {renderFormInput('AMC Name *', {
+              value: amcName,
+              onChangeText: setAmcName,
+            })}
+            <View style={styles.customerAutocompleteWrapper}>
+              {renderFormInput('Customer Name *', {
+                value: customerName,
+                onChangeText: text => {
+                  setCustomerName(text);
+                  setShowCustomerSuggestions(true);
+                  setShowNumberSuggestions(false);
+                },
+                onFocus: () => {
+                  setShowCustomerSuggestions(true);
+                  setShowNumberSuggestions(false);
+                  preloadCustomers();
+                },
+              })}
+              {renderCustomerSuggestions()}
+            </View>
+            <View style={styles.customerNumberWrapper}>
+              {renderFormInput('Customer Number *', {
+                value: customerNumber,
+                onChangeText: text => {
+                  setCustomerNumber(text);
+                  setShowNumberSuggestions(true);
+                  setShowCustomerSuggestions(false);
+                },
+                onFocus: () => {
+                  setShowNumberSuggestions(true);
+                  setShowCustomerSuggestions(false);
+                  preloadCustomers();
+                },
+                keyboardType: 'phone-pad',
+                trailing: <ContactBookButton onPress={openContacts} />,
+              })}
+              {renderNumberSuggestions()}
+            </View>
+            {renderFormInput('Email ID', {
+              value: customerEmail,
+              onChangeText: setCustomerEmail,
+              keyboardType: 'email-address',
+            })}
+            {/* Java (dialog_add_amc_new): the address field is not focusable -- tapping it opens Google Places. */}
+            <Pressable onPress={() => setPlaceSearchOpen(true)}>
+              <View pointerEvents="none">
+                {renderFormInput('Address *', {
+                  value: customerAddress,
+                  editable: false,
+                })}
+              </View>
+            </Pressable>
+            {renderFormInput('Landmark *', {
+              value: customerLandmark,
+              onChangeText: setCustomerLandmark,
+            })}
+            {renderFormInput('Brand Name *', {
+              value: brandName,
+              onChangeText: setBrandName,
+            })}
+            {renderFormInput('Model Name *', {
+              value: modelName,
+              onChangeText: setModelName,
+            })}
+            {renderFormInput('Serial No. *', {
+              value: serialNo,
+              onChangeText: text => setSerialNo(normalizeSerialNo(text)),
+              autoCapitalize: 'characters',
+              maxLength: SERIAL_NO_MAX_LENGTH,
+            })}
+
+            <View style={styles.warrantyRow}>
+              <Text style={styles.warrantyLabel}>{t('under_warranty')}</Text>
+              <View style={styles.warrantyControl}>
+                <Pressable
+                  style={[
+                    styles.warrantyOption,
+                    !underWarranty ? styles.warrantyOptionActive : null,
+                  ]}
+                  onPress={() => setUnderWarranty(false)}
+                >
+                  <Text
+                    style={[
+                      styles.warrantyText,
+                      !underWarranty ? styles.warrantyTextActive : null,
+                    ]}
+                  >
+                    {t('no')}
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[
+                    styles.warrantyOption,
+                    underWarranty ? styles.warrantyOptionActive : null,
+                  ]}
+                  onPress={() => setUnderWarranty(true)}
+                >
+                  <Text
+                    style={[
+                      styles.warrantyText,
+                      underWarranty ? styles.warrantyTextActive : null,
+                    ]}
+                  >
+                    {t('yes')}
+                  </Text>
+                </Pressable>
+              </View>
+            </View>
+
+            {/* Field order follows dialog_add_amc_new.xml. Service Amount and
+                Received Amount are only shown when Under Warranty = NO
+                (AMCDialog's segmentedGroupWarranty listener). */}
+            <View style={styles.formPairRow}>
+              {renderPickerInput(
+                'Activation Date *',
+                activationDate ? formatFormDate(activationDate) : '',
+                () => openDatePicker('activation'),
+                { half: true },
+              )}
+              {renderPickerInput(
+                'Time *',
+                serviceTime ? formatFormTime(serviceTime) : '',
+                openTimePicker,
+                { half: true },
+              )}
+            </View>
+            <View style={styles.formPairRow}>
+              {renderPickerInput(
+                'Contract Date *',
+                contractDate ? formatFormDate(contractDate) : '',
+                () => openDatePicker('contract'),
+                { half: true },
+              )}
+              {renderSelectField(
+                'No. of Services',
+                selectedServiceCount?.name ?? '',
+                () => openAddDropdown('services'),
+                true,
+              )}
+            </View>
+            {renderSelectField(
+              'Occurrence',
+              selectedOccurrence?.name ?? '',
+              () => openAddDropdown('occurrence'),
+            )}
+            {underWarranty
+              ? null
+              : renderFormInput('Service Amount *', {
+                  value: amcAmount,
+                  onChangeText: (t: string) => setAmcAmount(sanitizeDecimalInput(t)),
+                  keyboardType: 'decimal-pad',
+                })}
+            <View style={styles.formPairRow}>
+              {renderPickerInput(
+                'Expiry Date',
+                expiryDate ? formatCalculatedExpiryDate(expiryDate) : '',
+                () => openDatePicker('expiry'),
+                { half: true },
+              )}
+              {renderSelectField(
+                'Reminder',
+                selectedReminder?.name ?? '',
+                () => openAddDropdown('reminder'),
+                true,
+              )}
+            </View>
+            {showReceivedAmount
+              ? renderFormInput('Received Amount', {
+                  value: receivedAmount,
+                  onChangeText: (t: string) => setReceivedAmount(sanitizeDecimalInput(t)),
+                  keyboardType: 'decimal-pad',
+                })
+              : null}
+            {renderFormInput('Note', {
+              value: note,
+              onChangeText: setNote,
+            })}
+
+            <Pressable
+              style={styles.submitAMCButton}
+              onPress={handleSubmitAddAMC}
+            >
+              <View style={styles.submitAMCIconWrap}>
+                <AmcIcon size={ms(30)} color="#FFFFFF" />
+              </View>
+              <Text style={styles.submitAMCText}>{t('add').toUpperCase()}</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.cancelAMCButton}
+              onPress={() => {
+                setAddModalVisible(false);
+                onAddAmcModalClose?.();
+                resetAddAMCForm();
+              }}
+            >
+              <Text style={styles.cancelAMCText}>{t('cancel')}</Text>
+            </Pressable>
+          </ScrollView>
+        </View>
+        <PlaceSearchModal
+          visible={placeSearchOpen}
+          onClose={() => setPlaceSearchOpen(false)}
+          onSelect={place => {
+            setCustomerAddress(place.address);
+            setCustomerLat(String(place.latitude));
+            setCustomerLng(String(place.longitude));
+            setPlaceSearchOpen(false);
+          }}
+        />
+        {contactPickerModal}
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+
+    // Show the Add AMC form with its pickers (calendar, time, No. of Services, Occurrence, Reminder).
+    if (modalOnly) {
+      return (
+        <>
+          {renderAddAMCModal()}
+          {renderAddDropdownModal()}
+          {renderCalendarDialog()}
+          {renderTimeDialog()}
+        </>
+      );
+    }
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.header}>
+        {/* The menu/title/notification row used to be drawn here; it's now
+            the shared AppHeader rendered once by AdminTabs, above
+            AdminHomeScreen (which this screen is embedded in). */}
+        <View style={styles.filterRow}>
+          <Pressable
+            style={styles.headerFilter}
+            onPress={() => setTypeModalVisible(true)}
+          >
+            <Text numberOfLines={1} style={styles.headerFilterText}>
+              {selectedType.name}
+            </Text>
+            <Ionicons name="chevron-down" style={styles.headerArrow} />
+          </Pressable>
+
+          <Pressable
+            style={styles.headerFilter}
+            onPress={() => setMonthModalVisible(true)}
+          >
+            <Text numberOfLines={1} style={styles.headerFilterText}>
+              {selectedMonth.label}
+            </Text>
+            <Ionicons name="chevron-down" style={styles.headerArrow} />
+          </Pressable>
+        </View>
+      </View>
+
+      <View style={styles.sheet}>
+      <View style={styles.searchRow}>
+        <View style={styles.searchBox}>
+        <Ionicons name="search" style={styles.searchIcon} />
+        <TextInput
+          style={styles.searchInput}
+          placeholder={t('rn_search_amc')}
+          placeholderTextColor={COLORS.lightGray}
+          value={search}
+          onChangeText={setSearch}
+          returnKeyType="search"
+        />
+        {search ? (
+          <Pressable onPress={() => setSearch('')} style={styles.clearButton}>
+            <Ionicons name="close" style={styles.clearText} />
+          </Pressable>
+        ) : null}
+        </View>
+        <Pressable
+          style={styles.addButton}
+          onPress={() => setAddModalVisible(true)}
+        >
+          <Text style={styles.addButtonText}>+ {t('title_amc').toUpperCase()}</Text>
+        </Pressable>
+        <View style={{flex: 0.06}} />
+      </View>
+
+      {loading ? (
+        <View style={styles.loadingRow}>
+          <ActivityIndicator color={THEME_PRIMARY} />
+          <Text style={styles.loadingText}>{t('rn_loading_amc')}</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={filtered}
+          keyExtractor={getAMCKey}
+          renderItem={renderAMCItem}
+          contentContainerStyle={[
+            styles.listContent,
+            filtered.length === 0 ? styles.emptyListContent : null,
+          ]}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={() => loadAMCList(true)}
+              colors={[THEME_PRIMARY]}
+              tintColor={THEME_PRIMARY}
+            />
+          }
+          ListEmptyComponent={
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyMark}>!</Text>
+              <Text style={styles.emptyTitle}>{t('rn_no_amc_records_found')}</Text>
+            </View>
+          }
+        />
+      )}
+      </View>
+
+      {renderPickerModal(
+        typeModalVisible,
+        'Select AMC Type',
+        () => setTypeModalVisible(false),
+        amcTypes.map(option => (
+          <Pressable
+            key={option.id}
+            style={[
+              styles.optionRow,
+              option.id === selectedType.id ? styles.optionRowSelected : null,
+            ]}
+            onPress={() => {
+              setSelectedType(option);
+              setTypeModalVisible(false);
+            }}
+          >
+            <Text
+              style={[
+                styles.optionText,
+                option.id === selectedType.id
+                  ? styles.optionTextSelected
+                  : null,
+              ]}
+            >
+              {option.name}
+            </Text>
+          </Pressable>
+        )),
+      )}
+
+      {renderPickerModal(
+        monthModalVisible,
+        'Select Month',
+        () => setMonthModalVisible(false),
+        monthOptions.map(option => (
+          <Pressable
+            key={`${option.month}-${option.year}`}
+            style={[
+              styles.optionRow,
+              option.month === selectedMonth.month &&
+              option.year === selectedMonth.year
+                ? styles.optionRowSelected
+                : null,
+            ]}
+            onPress={() => {
+              setSelectedMonth(option);
+              setMonthModalVisible(false);
+            }}
+          >
+            <Text
+              style={[
+                styles.optionText,
+                option.month === selectedMonth.month &&
+                option.year === selectedMonth.year
+                  ? styles.optionTextSelected
+                  : null,
+              ]}
+            >
+              {option.label}
+            </Text>
+          </Pressable>
+        )),
+      )}
+
+      {renderAddAMCModal()}
+      {renderAddDropdownModal()}
+      {renderCalendarDialog()}
+      {renderTimeDialog()}
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: THEME_PRIMARY },
+  sheet: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: ms(30),
+    borderTopRightRadius: ms(30),
+    paddingTop: ms(10),
+    overflow: 'hidden',
+  },
+  header: {
+    backgroundColor: THEME_PRIMARY,
+    paddingTop: ms(6),
+  },
+  toolbar: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    height: ms(42),
+    paddingHorizontal: ms(16),
+  },
+  menuButton: {
+    alignItems: 'flex-start',
+    justifyContent: 'center',
+    width: ms(30),
+  },
+  menuIcon: {
+    color: '#FFFFFF',
+    fontSize: sp(15),
+  },
+  toolbarTitle: {
+    color: '#FFFFFF',
+    flex: 1,
+    fontSize: sp(16),
+    fontWeight: '700',
+  },
+  toolbarActions: {
+    flexDirection: 'row',
+    gap: ms(18),
+  },
+  toolbarIcon: {
+    color: '#FFFFFF',
+    fontSize: sp(15),
+    fontWeight: '700',
+  },
+  filterRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    height: ms(44),
+    justifyContent: 'space-between',
+    paddingHorizontal: ms(16),
+  },
+  headerFilter: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    maxWidth: '48%',
+  },
+  headerFilterText: {
+    color: '#FFFFFF',
+    fontSize: sp(16),
+    marginRight: ms(10),
+  },
+  headerArrow: {
+    color: '#FFFFFF',
+    fontSize: ms(22),
+  },
+  searchRow: {
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    flexDirection: 'row',
+    paddingHorizontal: 10,
+    paddingBottom: ms(5),
+  },
+  searchBox: {
+    flex: 0.94,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.darkGray,
+    paddingHorizontal: ms(8),
+  },
+  searchIcon: {
+    color: COLORS.lightGray,
+    fontSize: ms(20),
+    marginRight: ms(8),
+  },
+  searchInput: {
+    color: COLORS.textBlack,
+    flex: 1,
+    fontSize: sp(14),
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+    height: ms(40),
+  },
+  clearButton: {
+    alignItems: 'center',
+    height: ms(28),
+    justifyContent: 'center',
+    width: ms(28),
+  },
+  clearText: {
+    color: COLORS.textBlack,
+    fontSize: ms(20),
+  },
+  addButton: {
+    alignItems: 'center',
+    backgroundColor: COLORS.textBlack,
+    borderRadius: ms(15),
+    height: ms(30),
+    justifyContent: 'center',
+    width: ms(60),
+  },
+  addButtonText: {
+    color: '#FFFFFF',
+    fontSize: sp(12),
+  },
+  listContent: {
+    paddingHorizontal: 10,
+    paddingBottom: ms(18),
+  },
+  emptyListContent: {
+    flexGrow: 1,
+  },
+  card: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  cardSurface: {
+    flex: 1,
+    flexDirection: 'row',
+    backgroundColor: '#FFFFFF',
+    borderRadius: ms(10),
+    margin: ms(8),
+    elevation: 1,
+    shadowColor: '#000',
+    shadowOpacity: 0.12,
+    shadowRadius: 3,
+    shadowOffset: {width: 0, height: 1},
+  },
+  timeText: {
+    color: COLORS.ink,
+    fontSize: sp(14),
+    fontWeight: '700',
+    marginLeft: ms(5),
+    marginTop: ms(16),
+    paddingRight: ms(5),
+  },
+  timeline: {
+    backgroundColor: '#8D99A6',
+    borderBottomRightRadius: ms(10),
+    borderTopRightRadius: ms(10),
+    marginVertical: ms(15),
+    width: ms(5),
+  },
+  cardBody: {
+    flex: 1,
+    justifyContent: 'center',
+    paddingRight: ms(10),
+    paddingVertical: ms(10),
+    paddingLeft: 10,
+  },
+  cardTopRow: {
+    flexDirection: 'row',
+  },
+  titleBlock: {
+    flex: 1,
+    paddingRight: ms(10),
+  },
+  typeText: {
+    color: COLORS.ink,
+    fontSize: sp(14),
+    marginBottom: ms(5),
+  },
+  customerText: {
+    color: COLORS.ink,
+    fontSize: sp(15),
+    fontWeight: '700',
+    marginBottom: ms(5),
+  },
+  serviceRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+  },
+  serviceLabel: {
+    color: COLORS.textBlack,
+    fontSize: sp(12),
+    fontWeight: '700',
+  },
+  serviceValue: {
+    color: COLORS.authText,
+    fontSize: sp(12),
+  },
+  countBlock: {
+    alignItems: 'flex-end',
+    minWidth: ms(58),
+  },
+  dateText: {
+    color: COLORS.lightGray,
+    fontSize: sp(12),
+    fontStyle: 'italic',
+    marginBottom: ms(4),
+  },
+  countText: {
+    color: COLORS.ink,
+    fontSize: sp(24),
+    fontWeight: '700',
+  },
+  countSlash: {
+    color: COLORS.ink,
+    fontSize: sp(15),
+    fontWeight: '700',
+  },
+  countTotal: {
+    color: COLORS.primary,
+    fontSize: sp(15),
+    fontWeight: '700',
+  },
+  metaRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginTop: ms(8),
+  },
+  metaLabel: {
+    color: COLORS.ink,
+    flex: 0.26,
+    fontSize: sp(12),
+    fontWeight: '700',
+  },
+  metaValue: {
+    color: COLORS.authText,
+    flex: 0.34,
+    fontSize: sp(12),
+  },
+  taskLabel: {
+    color: COLORS.textBlack,
+    flex: 0.2,
+    fontSize: sp(12),
+    fontWeight: '700',
+  },
+  taskValue: {
+    color: COLORS.authText,
+    flex: 0.2,
+    fontSize: sp(12),
+  },
+  loadingRow: {
+    alignItems: 'center',
+    flex: 1,
+    justifyContent: 'center',
+  },
+  loadingText: {
+    color: '#777777',
+    fontSize: sp(13),
+    marginTop: ms(8),
+  },
+  emptyState: {
+    alignItems: 'center',
+    flex: 1,
+    justifyContent: 'center',
+    padding: ms(24),
+  },
+  emptyMark: {
+    color: '#B8B8B8',
+    fontSize: sp(30),
+    fontWeight: '800',
+    marginBottom: ms(8),
+  },
+  emptyTitle: {
+    color: '#777777',
+    fontSize: sp(14),
+    fontWeight: '700',
+  },
+  modalBackdrop: {
+    backgroundColor: 'rgba(0, 0, 0, 0.35)',
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: ms(22),
+  },
+  modalPanel: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: ms(8),
+    width: '100%',
+    maxWidth: ms(420),
+    maxHeight: '75%',
+    paddingVertical: ms(10),
+  },
+  modalTitle: {
+    color: '#111111',
+    fontSize: sp(16),
+    fontWeight: '800',
+    paddingHorizontal: ms(16),
+    paddingVertical: ms(10),
+  },
+  optionRow: {
+    paddingHorizontal: ms(16),
+    paddingVertical: ms(13),
+  },
+  optionRowSelected: {
+    backgroundColor: '#F8E6EA',
+  },
+  optionText: {
+    color: '#222222',
+    fontSize: sp(14),
+  },
+  optionTextSelected: {
+    color: THEME_PRIMARY,
+    fontWeight: '800',
+  },
+  addModalRoot: {
+    backgroundColor: COLORS.dialogDim,
+    flex: 1,
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+  },
+  addModalPanel: {
+    backgroundColor: '#FFFFFF',
+    width: '100%',
+    maxWidth: ms(560),
+    borderTopLeftRadius: ms(25),
+    borderTopRightRadius: ms(25),
+    maxHeight: '94%',
+    overflow: 'hidden',
+  },
+  addModalHeader: {
+    alignItems: 'center',
+    backgroundColor: COLORS.statusOnHold,
+    borderRadius: ms(20),
+    flexDirection: 'row',
+    height: ms(60),
+    paddingHorizontal: ms(20),
+  },
+  addModalTitle: {
+    color: '#FFFFFF',
+    flex: 1,
+    fontSize: sp(22),
+    fontWeight: '500',
+  },
+  addModalClose: {
+    alignItems: 'center',
+    height: ms(38),
+    justifyContent: 'center',
+    width: ms(38),
+  },
+  addModalCloseText: {
+    color: '#FFFFFF',
+    fontSize: sp(32),
+    fontWeight: '300',
+    lineHeight: sp(34),
+  },
+  addFormScroll: {
+    backgroundColor: '#FFFFFF',
+  },
+  addFormContent: {
+    paddingBottom: ms(18),
+    paddingHorizontal: ms(20),
+    paddingTop: ms(12),
+  },
+  formInputShell: {
+    alignItems: 'center',
+    borderColor: COLORS.lightGray,
+    borderRadius: ms(34),
+    borderWidth: ms(1),
+    flexDirection: 'row',
+    height: ms(41),
+    marginBottom: ms(26),
+    paddingHorizontal: ms(18),
+  },
+  formInput: {
+    color: '#000000',
+    flex: 1,
+    fontSize: sp(16),
+    height: ms(40),
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+  },
+  formFloatLabel: {
+    backgroundColor: '#FFFFFF',
+    color: COLORS.lightGray,
+    fontSize: sp(12),
+    left: ms(14),
+    paddingHorizontal: ms(4),
+    position: 'absolute',
+    top: -ms(8),
+  },
+  formTrailing: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: ms(8),
+  },
+  customerAutocompleteWrapper: {
+    zIndex: 30,
+  },
+  customerNumberWrapper: {
+    zIndex: 20,
+  },
+  customerSuggestionPanel: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#D9D9D9',
+    borderRadius: ms(8),
+    borderWidth: ms(1),
+    elevation: 8,
+    left: 0,
+    maxHeight: ms(210),
+    position: 'absolute',
+    right: 0,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.2,
+    shadowRadius: 5,
+    top: ms(43),
+    zIndex: 30,
+  },
+  customerSuggestionList: {
+    maxHeight: ms(208),
+  },
+  customerSuggestionItem: {
+    borderBottomColor: '#EEEEEE',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: ms(14),
+    paddingVertical: ms(10),
+  },
+  customerSuggestionName: {
+    color: '#111111',
+    fontSize: sp(15),
+    fontWeight: '700',
+  },
+  customerSuggestionMeta: {
+    color: '#777777',
+    fontSize: sp(12),
+    marginTop: ms(3),
+  },
+  customerSuggestionStatus: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    minHeight: ms(52),
+    paddingHorizontal: ms(14),
+  },
+  customerSuggestionStatusText: {
+    color: '#777777',
+    fontSize: sp(13),
+    marginLeft: ms(8),
+  },
+  contactIcon: {
+    color: THEME_PRIMARY,
+    fontSize: sp(15),
+    fontWeight: '800',
+  },
+  warrantyRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginBottom: ms(26),
+    minHeight: ms(30),
+  },
+  warrantyLabel: {
+    color: COLORS.darkGray,
+    flex: 1,
+    fontSize: sp(14),
+    marginLeft: ms(4),
+  },
+  warrantyControl: {
+    borderColor: COLORS.ink,
+    borderRadius: ms(25),
+    borderWidth: ms(1),
+    flexDirection: 'row',
+    height: ms(30),
+    overflow: 'hidden',
+    width: '45%',
+  },
+  warrantyOption: {
+    alignItems: 'center',
+    flex: 1,
+    justifyContent: 'center',
+  },
+  warrantyOptionActive: {
+    backgroundColor: COLORS.ink,
+  },
+  warrantyText: {
+    color: COLORS.ink,
+    fontSize: sp(14),
+    fontWeight: '400',
+  },
+  warrantyTextActive: {
+    color: '#FFFFFF',
+  },
+  formPairRow: {
+    flexDirection: 'row',
+    gap: ms(10),
+  },
+  formHalf: {
+    flex: 1,
+  },
+  formSelectText: {
+    color: '#777777',
+    flex: 1,
+    fontSize: sp(15),
+  },
+  formValueText: {
+    color: '#1F2937',
+  },
+  formSelectArrow: {
+    color: '#1F2937',
+    fontSize: sp(18),
+    fontWeight: '800',
+    marginLeft: ms(8),
+  },
+  submitAMCButton: {
+    alignItems: 'center',
+    backgroundColor: THEME_PRIMARY,
+    borderRadius: ms(34),
+    elevation: 4,
+    flexDirection: 'row',
+    height: ms(48),
+    justifyContent: 'center',
+    marginTop: ms(10),
+    marginBottom: ms(10),
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3,
+  },
+  submitAMCIconWrap: {
+    left: ms(17),
+    position: 'absolute',
+  },
+  submitAMCText: {
+    color: '#FFFFFF',
+    fontSize: sp(18),
+    fontWeight: '500',
+    textAlign: 'center',
+  },
+  cancelAMCButton: {
+    alignItems: 'center',
+    height: ms(52),
+    justifyContent: 'center',
+  },
+  cancelAMCText: {
+    color: THEME_PRIMARY,
+    fontSize: sp(18),
+    fontWeight: '500',
+  },
+  pickerOverlay: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    flex: 1,
+    justifyContent: 'center',
+    paddingHorizontal: ms(24),
+  },
+  dateDialog: {
+    backgroundColor: '#FFFFFF',
+    elevation: 8,
+    maxWidth: ms(420),
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.24,
+    shadowRadius: 8,
+    width: '100%',
+  },
+  dateDialogHeader: {
+    backgroundColor: '#C8142E',
+    paddingHorizontal: ms(24),
+    paddingVertical: ms(18),
+  },
+  dateDialogYear: {
+    color: '#F5B3BC',
+    fontSize: sp(16),
+    fontWeight: '800',
+  },
+  dateDialogTitle: {
+    color: '#FFFFFF',
+    fontSize: sp(31),
+    fontWeight: '800',
+    marginTop: ms(4),
+  },
+  calendarBody: {
+    paddingHorizontal: ms(28),
+    paddingTop: ms(22),
+  },
+  calendarMonthRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: ms(22),
+  },
+  calendarNav: {
+    color: '#222222',
+    fontSize: sp(36),
+    fontWeight: '300',
+    lineHeight: sp(38),
+  },
+  calendarMonthText: {
+    color: '#222222',
+    fontSize: sp(16),
+    fontWeight: '800',
+  },
+  calendarGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+  },
+  weekdayText: {
+    color: '#888888',
+    fontSize: sp(14),
+    fontWeight: '700',
+    marginBottom: ms(18),
+    textAlign: 'center',
+    width: `${100 / 7}%`,
+  },
+  calendarDay: {
+    alignItems: 'center',
+    height: ms(42),
+    justifyContent: 'center',
+    marginBottom: ms(2),
+    width: `${100 / 7}%`,
+  },
+  calendarDayInner: {
+    alignItems: 'center',
+    height: ms(42),
+    justifyContent: 'center',
+    width: ms(42),
+  },
+  calendarDaySelected: {
+    backgroundColor: '#C8142E',
+    borderRadius: ms(21),
+  },
+  calendarDayText: {
+    color: '#444444',
+    fontSize: sp(16),
+  },
+  calendarDayTextSelected: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+  },
+  dialogActionRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: ms(34),
+    justifyContent: 'flex-end',
+    paddingBottom: ms(24),
+    paddingTop: ms(22),
+  },
+  dialogActionText: {
+    color: '#C8142E',
+    fontSize: sp(15),
+    fontWeight: '800',
+  },
+  timeDialog: {
+    backgroundColor: '#FFFFFF',
+    elevation: 8,
+    maxWidth: ms(520),
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.24,
+    shadowRadius: 8,
+    width: '100%',
+  },
+  timeDialogHeader: {
+    alignItems: 'center',
+    backgroundColor: '#C8142E',
+    flexDirection: 'row',
+    justifyContent: 'center',
+    minHeight: ms(118),
+    paddingHorizontal: ms(20),
+  },
+  timeDisplayRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+  },
+  timeDisplay: {
+    color: '#FFFFFF',
+    fontSize: sp(54),
+    fontWeight: '300',
+  },
+  timeDisplayInactive: {
+    color: 'rgba(255, 255, 255, 0.55)',
+  },
+  timeDisplayColon: {
+    marginHorizontal: ms(4),
+  },
+  periodColumn: {
+    marginLeft: ms(18),
+  },
+  periodText: {
+    color: 'rgba(255, 255, 255, 0.55)',
+    fontSize: sp(18),
+    fontWeight: '800',
+    lineHeight: sp(28),
+  },
+  periodTextActive: {
+    color: '#FFFFFF',
+  },
+  clockBody: {
+    paddingBottom: ms(18),
+    paddingHorizontal: ms(24),
+    paddingTop: ms(22),
+  },
+  clockFace: {
+    alignSelf: 'center',
+    backgroundColor: '#EEEEEE',
+    marginBottom: ms(10),
+    position: 'relative',
+  },
+  clockHand: {
+    backgroundColor: '#C8142E',
+    height: ms(2),
+    position: 'absolute',
+  },
+  clockCenterDot: {
+    backgroundColor: '#C8142E',
+    borderRadius: ms(4),
+    height: ms(8),
+    position: 'absolute',
+    width: ms(8),
+  },
+  clockNumber: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'absolute',
+  },
+  clockNumberSelected: {
+    backgroundColor: '#C8142E',
+  },
+  clockNumberText: {
+    color: '#333333',
+    fontSize: sp(16),
+  },
+  clockNumberTextSelected: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+  },
+  timeActionRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+  },
+  timeActionButtons: {
+    flexDirection: 'row',
+    gap: ms(34),
+  },
+  searchDropdownBackdrop: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    flex: 1,
+    justifyContent: 'center',
+    paddingHorizontal: ms(28),
+  },
+  searchDropdownPanel: {
+    backgroundColor: '#FFFFFF',
+    maxHeight: '62%',
+    maxWidth: ms(540),
+    paddingBottom: ms(20),
+    paddingHorizontal: ms(22),
+    paddingTop: ms(22),
+    width: '100%',
+  },
+  searchDropdownTitle: {
+    color: '#666666',
+    fontSize: sp(22),
+    fontWeight: '800',
+    marginBottom: ms(14),
+  },
+  searchDropdownInput: {
+    borderColor: '#FF4054',
+    borderRadius: ms(8),
+    borderWidth: ms(1),
+    color: '#111111',
+    fontSize: sp(19),
+    height: ms(54),
+    marginBottom: ms(16),
+    paddingHorizontal: ms(14),
+  },
+  searchDropdownList: {
+    maxHeight: ms(260),
+  },
+  searchDropdownOption: {
+    justifyContent: 'center',
+    minHeight: ms(54),
+    paddingHorizontal: ms(10),
+  },
+  searchDropdownOptionSelected: {
+    backgroundColor: '#F8E6EA',
+  },
+  searchDropdownOptionText: {
+    color: '#111111',
+    fontSize: sp(18),
+  },
+  searchDropdownOptionTextSelected: {
+    color: THEME_PRIMARY,
+    fontWeight: '800',
+  },
+  searchDropdownEmpty: {
+    color: '#777777',
+    fontSize: sp(16),
+    paddingHorizontal: ms(10),
+    paddingVertical: ms(18),
+  },
+});
+
+export default AMCDashboardScreen;
